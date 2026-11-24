@@ -1394,6 +1394,16 @@ mod tests {
         assert!(!is(Some(0x9999), Some("victory host list 70")));
         assert!(!is(Some(0x9999), None));
         assert!(!is(None, None));
+        // The debug layer appends its own note to the name we gave.
+        assert!(is(None, Some("victory host list 7 (debug layer indirect)")));
+        assert!(is(None, Some("victory host list 7 (x)")));
+        assert!(!is(
+            None,
+            Some("victory host list 70 (debug layer indirect)")
+        ));
+        assert!(!is(None, Some("victory host list 7 debug layer")));
+        assert!(!is(None, Some("victory host list 7(")));
+        assert!(is(None, Some("victory host list 7")));
         assert_eq!(list_name(70), "victory host list 70");
     }
 
@@ -1454,6 +1464,24 @@ mod tests {
         other.push(0);
         node.pCommandListDebugNameW = windows::core::PCWSTR(other.as_ptr());
         assert!(!list.is_node(&node), "another list's name is no match");
+        // With the debug layer: our name and the layer's note, in either
+        // name field; and a list whose number only starts with ours is not it.
+        let note = std::ffi::CString::new(format!("{} (debug layer indirect)", list_name(list.id)))
+            .unwrap();
+        node.pCommandListDebugNameW = windows::core::PCWSTR::null();
+        node.pCommandListDebugNameA = note.as_ptr().cast();
+        assert!(
+            list.is_node(&node),
+            "found by its ANSI name with the layer's note"
+        );
+        let longer =
+            std::ffi::CString::new(format!("{}0 (debug layer indirect)", list_name(list.id)))
+                .unwrap();
+        node.pCommandListDebugNameA = longer.as_ptr().cast();
+        assert!(
+            !list.is_node(&node),
+            "a number that only starts with ours is no match"
+        );
     }
 }
 
@@ -1666,14 +1694,21 @@ fn identities(list: &impl Interface) -> Vec<usize> {
 /// Whether a node of the device-removed data is a list: by pointer, or by the
 /// name the runtime copied when the list was submitted. With the debug layer
 /// on, the object we hold is its wrapper and the runtime records another
-/// one, so no pointer of ours matches; the name still does.
+/// one, so no pointer of ours matches, and it appends its own note to our
+/// name ("victory host list 158 (debug layer indirect)"). The name matches
+/// exactly or followed by " (": never as the start of another number.
 fn node_is_list(
     node_pointer: Option<usize>,
     node_name: Option<&str>,
     pointers: &[usize],
     name: &str,
 ) -> bool {
-    node_pointer.is_some_and(|p| pointers.contains(&p)) || node_name == Some(name)
+    node_pointer.is_some_and(|p| pointers.contains(&p))
+        || node_name.is_some_and(|n| {
+            n == name
+                || n.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(" ("))
+        })
 }
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
@@ -2077,18 +2112,47 @@ impl Host {
                     return text;
                 }
             };
-            // Every list's progress (done/count), in the runtime's order.
-            let mut progress = Vec::new();
+            // The nodes, oldest list first, and which run each is.
+            let mut nodes = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
-                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let index = runs.iter().position(|r| r.is_node(p));
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                nodes.push(p);
                 node = p.pNext;
             }
+            let index: Vec<Option<usize>> = nodes
+                .iter()
+                .map(|p| runs.iter().position(|r| r.is_node(p)))
+                .collect();
+            if let Some(last) = nodes.last()
+                && index.iter().all(Option::is_none)
+            {
+                let name = |w: windows::core::PCWSTR, a: *const u8| {
+                    let w = (!w.is_null()).then(|| w.to_string().unwrap_or_default());
+                    let a = (!a.is_null()).then(|| {
+                        std::ffi::CStr::from_ptr(a.cast())
+                            .to_string_lossy()
+                            .into_owned()
+                    });
+                    format!("{w:?}/{a:?}")
+                };
+                tracing::warn!(
+                    nodes = nodes.len(),
+                    last_pointer = ?last.pCommandList.as_ref().map(|l| l.as_raw()),
+                    last_names = %name(last.pCommandListDebugNameW, last.pCommandListDebugNameA),
+                    "no breadcrumb node named one of our lists"
+                );
+            }
+            // Every list's progress (done/count), in the runtime's order.
+            let progress: Vec<String> = nodes
+                .iter()
+                .zip(&index)
+                .map(|(p, index)| {
+                    let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                    format!("{done}/{} {index:?}", p.BreadcrumbCount)
+                })
+                .collect();
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
-            let mut plain = crumbs.pHeadAutoBreadcrumbNode;
-            while let Some(p) = plain.as_ref() {
+            for (p, index) in nodes.iter().zip(&index) {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
@@ -2097,7 +2161,7 @@ impl Host {
                         "; a list stopped at command {done} of {} (op {})",
                         p.BreadcrumbCount, history[done as usize].0
                     ));
-                    let run = runs.iter().find(|r| r.is_node(p));
+                    let run = index.map(|i| runs[i]);
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -2124,7 +2188,6 @@ impl Host {
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
                 }
-                plain = p.pNext;
             }
         }
         text
@@ -2345,19 +2408,21 @@ impl HostList {
     fn is_node(&self, node: &D3D12_AUTO_BREADCRUMB_NODE) -> bool {
         // SAFETY: only the pointer and the name text are read: the pointer is
         // compared, never used, and the name is the runtime's copy.
-        let (pointer, text) = unsafe {
+        let (pointer, wide, ansi) = unsafe {
             (
                 node.pCommandList.as_ref().map(|l| l.as_raw() as usize),
                 (!node.pCommandListDebugNameW.is_null())
                     .then(|| node.pCommandListDebugNameW.to_string().unwrap_or_default()),
+                (!node.pCommandListDebugNameA.is_null()).then(|| {
+                    std::ffi::CStr::from_ptr(node.pCommandListDebugNameA.cast())
+                        .to_string_lossy()
+                        .into_owned()
+                }),
             )
         };
-        node_is_list(
-            pointer,
-            text.as_deref(),
-            &identities(&self.list),
-            &list_name(self.id),
-        )
+        let (pointers, name) = (identities(&self.list), list_name(self.id));
+        node_is_list(pointer, wide.as_deref(), &pointers, &name)
+            || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
 
     pub(crate) fn close(&self) {
