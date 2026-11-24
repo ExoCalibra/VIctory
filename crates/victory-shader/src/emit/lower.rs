@@ -1149,6 +1149,18 @@ impl<'a> Lower<'a> {
                     let m = i.read(Reg::S(code))?;
                     x.st.masks.get(&m).copied()
                 });
+                // So are the selectors of selects that derive from neither
+                // EXEC nor a compare.
+                let selectors = insts().filter_map(|i| match &i.fields {
+                    Fields::Valu(v) if i.name() == "v_cndmask_b32" => match v.src.get(2) {
+                        Some(&Operand::Scalar { code, .. }) if code != NULL => i.read(Reg::S(code)),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                let selectors = selectors
+                    .filter(|m| !x.st.masks.contains_key(m))
+                    .filter_map(|m| x.st.others.get(&m).copied());
                 let mut seen_bools = HashSet::new();
                 let mut seen_phis = HashSet::new();
                 let mut work: Vec<Bool> =
@@ -1159,6 +1171,7 @@ impl<'a> Lower<'a> {
                         .copied()
                         .chain(whens)
                         .chain(selects)
+                        .chain(selectors)
                         .collect();
                 let mut needs_console = false;
                 while let Some(g) = work.pop() {
@@ -3411,6 +3424,16 @@ impl<'a> Lower<'a> {
         if code == NULL {
             return Ok(self.s.m.bool(false));
         }
+        // A selector that derives from neither EXEC nor a compare (a constant,
+        // a number built from scalars) is a mask held as a number: with console
+        // lanes the lane tests its own bit.
+        if self.console_lanes
+            && let Some(m) = inst
+                .read(Reg::S(code))
+                .and_then(|m| self.x.st.others.get(&m).copied())
+        {
+            return self.boolean(m, self.cur);
+        }
         if !self.numeric_selects || !self.console_lanes {
             return Err(UNTRACKED_SELECT);
         }
@@ -3449,13 +3472,18 @@ impl<'a> Lower<'a> {
                 .find(|q| q.reg == h)
                 .map(|q| q.value);
         }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
+        // Written with it by one instruction; else (two instructions, one
+        // for each dword) the dword the mask's reader takes with it.
+        let together = || {
+            let b = *self.def_block.get(&lo)?;
+            let inst = p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+            let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
+            inst.write(pick(reg)?)
+        };
+        together().or_else(|| self.x.st.pairs.get(&lo).copied())
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
