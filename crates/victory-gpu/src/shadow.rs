@@ -155,6 +155,13 @@ impl Shadow {
         address - self.start
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_u32(&self, offset: usize) -> u32 {
+        assert!(offset + 4 <= self.len as usize);
+        // SAFETY: `offset..offset + 4` lies within the mapped host buffer.
+        unsafe { self.data.add(offset).cast::<u32>().read_unaligned() }
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -533,6 +540,9 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if address < 0x10000 {
+        return None;
+    }
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end);
@@ -606,6 +616,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     let start = address & !(WINDOW - 1);
+    let end = end.max(address.saturating_add(64 << 10));
     let len = end.checked_next_multiple_of(WINDOW)? - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
