@@ -6461,6 +6461,36 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             n if n.contains("_f64") => Err("floating-point arithmetic in f64 is not implemented by the DXIL emitter"),
+            "v_swap_b32" => {
+                if v.abs != 0
+                    || v.neg != 0
+                    || v.clamp
+                    || v.omod != 0
+                    || v.sdwa.is_some()
+                    || v.dpp.is_some()
+                {
+                    return Err("modifiers on v_swap_b32");
+                }
+                let Some(Operand::Vector { reg: dst, .. }) = v.dst else {
+                    return Err("v_swap_b32 outside a VGPR");
+                };
+                let Some(&Operand::Vector { reg: src, .. }) = v.src.first() else {
+                    return Err("v_swap_b32 from a non-VGPR");
+                };
+                let read_vgpr = |l: &mut Self, r: u8| -> Result<V, Why> {
+                    match inst.read(Reg::V(r)) {
+                        Some(o) => l.i32_of(o),
+                        None => Ok(l.s.m.i32(0)),
+                    }
+                };
+                let old_dst = read_vgpr(self, dst)?;
+                let old_src = read_vgpr(self, src)?;
+                self.write(inst, Reg::V(dst), old_src, guard);
+                if dst != src {
+                    self.write(inst, Reg::V(src), old_dst, guard);
+                }
+                Ok(())
+            }
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
