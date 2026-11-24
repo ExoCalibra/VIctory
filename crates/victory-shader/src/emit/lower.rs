@@ -37,6 +37,9 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Back edges that count against the spin-wait limit.
+    #[cfg(test)]
+    pub spin_loops: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -209,10 +212,16 @@ struct Lower<'a> {
     /// Loop headers whose natural loop executes an active `s_barrier`:
     /// these share `steps[1]` (group-uniform) instead of `steps[0]`.
     barrier_loops: HashSet<usize>,
-    /// Function-wide step counters: `[lane_loops, barrier_loops]`.
-    steps: [Option<StepTrack>; 2],
+    /// Function-wide step counters: `[lane_loops, barrier_loops, spin_loops]`.
+    steps: [Option<StepTrack>; 3],
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Headers of loops that only wait for memory to change: they stop
+    /// at [`super::spin_limit`] instead.
+    spin: HashSet<usize>,
+    /// Back edges given the spin-wait limit.
+    #[cfg(test)]
+    spun: usize,
 }
 
 /// SSA tracking for a function-wide loop step counter across IR blocks.
@@ -516,8 +525,11 @@ impl<'a> Lower<'a> {
             code_table: None,
             loop_limit,
             barrier_loops: HashSet::new(),
-            steps: [None, None],
+            steps: [None, None, None],
             abort: None,
+            spin: HashSet::new(),
+            #[cfg(test)]
+            spun: 0,
         }
     }
 
@@ -837,10 +849,12 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Function-wide step budgets (`LOOP_LIMIT`): non-barrier loops share
-        // `steps[0]`, and loops executing an active `s_barrier` share
-        // `steps[1]` so divergent earlier loops never desynchronise a barrier.
+        // Function-wide step budgets (`LOOP_LIMIT`, or `spin_limit` for spin
+        // waits): non-barrier loops share `steps[0]`, loops executing an active
+        // `s_barrier` share `steps[1]`, and spin-wait loops share `steps[2]`.
+        self.spin = super::spin::spin_loops(p);
         let mut has_lane_loops = false;
+        let mut has_spin_loops = false;
         for &h in &order {
             let back: Vec<usize> = p.blocks[h]
                 .preds
@@ -866,11 +880,17 @@ impl<'a> Lower<'a> {
             }
             if in_loop.into_iter().any(|u| self.has_active_barrier(u)) {
                 self.barrier_loops.insert(h);
+            } else if self.spin.contains(&h) {
+                has_spin_loops = true;
             } else {
                 has_lane_loops = true;
             }
         }
-        for (kind, needed) in [(0, has_lane_loops), (1, !self.barrier_loops.is_empty())] {
+        for (kind, needed) in [
+            (0, has_lane_loops),
+            (1, !self.barrier_loops.is_empty()),
+            (2, has_spin_loops),
+        ] {
             if !needed {
                 continue;
             }
@@ -962,6 +982,8 @@ impl<'a> Lower<'a> {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            #[cfg(test)]
+            spin_loops: self.spun,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6588,6 +6610,16 @@ impl<'a> Lower<'a> {
         self.rpo[to] <= self.rpo[from]
     }
 
+    fn step_kind(&self, header: usize) -> usize {
+        if self.barrier_loops.contains(&header) {
+            1
+        } else if self.spin.contains(&header) {
+            2
+        } else {
+            0
+        }
+    }
+
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
         let offset = self.x.p.blocks[b]
             .insts
@@ -6595,7 +6627,7 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.is_back_edge(b, t) => {
-                let kind = usize::from(self.barrier_loops.contains(&t));
+                let kind = self.step_kind(t);
                 let (ok, next) = self.step_back_edge(kind, pred::IULT);
                 self.push_step_edge(t, self.cur, Some((kind, next)));
                 let abort = self.abort_block();
@@ -6649,8 +6681,8 @@ impl<'a> Lower<'a> {
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
                 let (cond, upd_t, upd_f) = if bt && bf {
-                    let kt = usize::from(self.barrier_loops.contains(&taken));
-                    let kf = usize::from(self.barrier_loops.contains(&not_taken));
+                    let kt = self.step_kind(taken);
+                    let kf = self.step_kind(not_taken);
                     let (ok, ut, uf) = if kt == kf {
                         let (ok, next) = self.step_back_edge(kt, pred::IULT);
                         (ok, Some((kt, next)), Some((kt, next)))
@@ -6667,12 +6699,12 @@ impl<'a> Lower<'a> {
                     self.tail[b] = Some(cont);
                     (cond, ut, uf)
                 } else if bt {
-                    let kind = usize::from(self.barrier_loops.contains(&taken));
+                    let kind = self.step_kind(taken);
                     let (ok, next) = self.step_back_edge(kind, pred::IULT);
                     let cond = self.s.m.bin(self.cur, Bin::And, cond, ok);
                     (cond, Some((kind, next)), Some((kind, next)))
                 } else if bf {
-                    let kind = usize::from(self.barrier_loops.contains(&not_taken));
+                    let kind = self.step_kind(not_taken);
                     let (stop, next) = self.step_back_edge(kind, pred::IUGE);
                     let cond = self.s.m.bin(self.cur, Bin::Or, cond, stop);
                     (cond, Some((kind, next)), Some((kind, next)))
@@ -6709,7 +6741,8 @@ impl<'a> Lower<'a> {
     }
 
     /// Increments step counter `kind` at a back-edge and compares against
-    /// [`Self::loop_limit`] by `p` (below: continue; at or above: stop).
+    /// [`Self::loop_limit`] (or [`super::spin_limit`] for spin waits, `kind == 2`)
+    /// by `p` (below: continue; at or above: stop).
     fn step_back_edge(&mut self, kind: usize, p: u8) -> (V, V) {
         let c = self.cur;
         let cur = self.steps[kind]
@@ -6718,7 +6751,16 @@ impl<'a> Lower<'a> {
             .expect("step counter");
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, cur, one);
-        let limit = self.s.m.i32(self.loop_limit);
+        let limit = if kind == 2 {
+            #[cfg(test)]
+            {
+                self.spun += 1;
+            }
+            super::spin_limit().min(self.loop_limit)
+        } else {
+            self.loop_limit
+        };
+        let limit = self.s.m.i32(limit);
         let cmp = self.s.m.cmp(c, p, next, limit);
         (cmp, next)
     }
@@ -6828,8 +6870,10 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use super::{Lowered, Numeric, Parts, buffer_format, lower};
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6865,6 +6909,120 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
+    }
+
+    /// Lowers a compute program with the root parameters `layout` (in user
+    /// SGPRs from s0 on) and the used resources `used`.
+    fn lower_with(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                // The layout's user SGPRs (at least two), 512 bytes of LDS.
+                rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    /// A table at s0 holding structured buffers of dwords.
+    fn dword_buffers() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let root = RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        let used = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        (vec![root], vec![used])
+    }
+
+    #[test]
+    fn a_spin_wait_on_a_table_buffer_gets_the_spin_limit() {
+        // Each lane rereads its flag in a buffer loaded from the table at
+        // s0 until it is no longer 0, then copies it to LDS.
+        let spin = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xE030_6000,
+            0x8002_0100, // 0x14: buffer_load_dword v1, v0, s[8:11], 0 idxen glc
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFFA, // s_cbranch_execnz -> 0x14
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let (layout, used) = dword_buffers();
+        let l = lower_with(&spin, layout, used).unwrap();
+        assert_eq!(l.spin_loops, 1);
+    }
+
+    #[test]
+    fn a_loop_that_writes_lds_keeps_the_loop_limit() {
+        // The same loop with the LDS write inside it: it has an effect each
+        // round, so it is no spin wait.
+        let writes = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xE030_6000,
+            0x8002_0100, // 0x14: buffer_load_dword v1, v0, s[8:11], 0 idxen glc
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFF8, // s_cbranch_execnz -> 0x14
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            S_ENDPGM,
+        ];
+        let (layout, used) = dword_buffers();
+        let l = lower_with(&writes, layout, used).unwrap();
+        assert_eq!(l.spin_loops, 0);
     }
 
     #[test]
