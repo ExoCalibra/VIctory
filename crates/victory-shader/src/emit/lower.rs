@@ -373,6 +373,14 @@ fn value_bound(
     b
 }
 
+/// The f16 bits of inline float constant `c` (240..=248: 0.5, -0.5, 1.0,
+/// -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi)).
+fn inline_f16(c: u8) -> u32 {
+    [
+        0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+    ][usize::from(c - 240)]
+}
+
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -2283,6 +2291,19 @@ impl<'a> Lower<'a> {
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
             Operand::Attr { .. } => Err("an attribute operand"),
+        }
+    }
+
+    /// An operand read as f16 data: an inline float constant is its f16
+    /// value in both halves (so op_sel picks either), not the f32 bits
+    /// `operand` gives, whose low half is 0.
+    fn f16_operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
+        match *op {
+            Operand::Const(c @ 240..=248) => {
+                let h = inline_f16(c);
+                Ok(self.s.m.i32(h | h << 16))
+            }
+            _ => self.operand(inst, op),
         }
     }
 
@@ -6210,8 +6231,8 @@ impl<'a> Lower<'a> {
                 let mut xs = Vec::new();
                 for i in 0..3 {
                     let op = v.src.get(i).ok_or("a missing operand")?;
-                    let x = self.operand(inst, op)?;
                     let mut x = if v.opsel_hi >> i & 1 != 0 {
+                        let x = self.f16_operand(inst, op)?;
                         let h = if v.opsel >> i & 1 != 0 {
                             let k16 = self.s.m.i32(16);
                             self.s.m.bin(c, Bin::LShr, x, k16)
@@ -6221,6 +6242,7 @@ impl<'a> Lower<'a> {
                         self.s
                             .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[h])
                     } else {
+                        let x = self.operand(inst, op)?;
                         self.as_float(x)
                     };
                     if v.neg_hi >> i & 1 != 0 {
@@ -6289,7 +6311,7 @@ impl<'a> Lower<'a> {
                 let mut halves = Vec::new();
                 for k in 0..2 {
                     let op = v.src.get(k).ok_or("a missing operand")?;
-                    let mut x = self.operand(inst, op)?;
+                    let mut x = self.f16_operand(inst, op)?;
                     if v.opsel >> k & 1 != 0 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
@@ -6632,12 +6654,7 @@ impl<'a> Lower<'a> {
         }
         let x = match (op, self.src0) {
             (_, Some(x)) if k == 0 => x,
-            (Operand::Const(c @ 240..=248), _) => {
-                let h = [
-                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                ][usize::from(c - 240)];
-                self.s.m.i32(h)
-            }
+            (Operand::Const(c @ 240..=248), _) => self.s.m.i32(inline_f16(c)),
             _ => self.operand(inst, &op)?,
         };
         let c = self.cur;
@@ -6993,16 +7010,7 @@ impl<'a> Lower<'a> {
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
-        let x = match op {
-            Operand::Const(c @ 240..=248) => {
-                let h = [
-                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                ][usize::from(c - 240)];
-                // shortcut: taken to fill both halves.
-                self.s.m.i32(h | h << 16)
-            }
-            _ => self.operand(inst, &op)?,
-        };
+        let x = self.f16_operand(inst, &op)?;
         let c = self.cur;
         let x = if sel {
             let k16 = self.s.m.i32(16);
@@ -10385,7 +10393,7 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, SubDword, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, SubDword, buffer_format, half_shift, inline_f16, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -10926,6 +10934,28 @@ mod tests {
             ),
             "{e}"
         );
+    }
+
+    /// An f16 (sign, 5-bit exponent, 10-bit fraction) as an f32; normal numbers only.
+    fn f16_value(h: u32) -> f32 {
+        let sign = if h >> 15 != 0 { -1.0 } else { 1.0 };
+        let exponent = (h >> 10 & 0x1F) as i32 - 15;
+        sign * (1.0 + (h & 0x3FF) as f32 / 1024.0) * 2f32.powi(exponent)
+    }
+
+    #[test]
+    fn inline_float_constants_mean_the_same_in_f16() {
+        // v_fma_mix and v_pack_b32_f16 read these as f16: 1.0 must be 0x3C00,
+        // not the low half (0) of the f32 bits 0x3F800000.
+        assert_eq!(inline_f16(242), 0x3C00);
+        for code in 240..=248u8 {
+            let f32_value = f32::from_bits(crate::resource::inline(code).unwrap());
+            let f16_value = f16_value(inline_f16(code));
+            assert!(
+                (f32_value - f16_value).abs() <= f32_value.abs() * 1e-3,
+                "inline constant {code}: f32 {f32_value}, f16 {f16_value}"
+            );
+        }
     }
 
     #[test]
