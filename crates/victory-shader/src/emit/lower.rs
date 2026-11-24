@@ -11629,28 +11629,38 @@ impl<'a> Lower<'a> {
         self.descriptor_dwords.contains(&v)
     }
 
-    fn fill_phis(&mut self) -> Result<(), Stop> {
+    fn drain_pending_masks(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
-            let args = self
-                .x
-                .st
-                .phi_masks
-                .get(&phi.value)
-                .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
+            let phi_args = self.x.st.phi_masks.get(&phi.value);
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let x = self
-                    .boolean(args[n], qb)
-                    .map_err(|w| unsupported(offset, w))?;
+                let arg = &phi.args[n];
+                let m = if let Some(args) = phi_args {
+                    args[n]
+                } else {
+                    // Console flow: every lane arrives by every edge, so a join
+                    // also takes masks that are constants or built from scalars.
+                    let others = self.console_cf.then(|| self.x.st.others.get(arg)).flatten();
+                    *self.x.st.masks.get(arg).or(others).ok_or_else(|| {
+                        unsupported(offset, "a lane-mask join of an untracked mask")
+                    })?
+                };
+                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);
         }
+        Ok(())
+    }
+
+    fn fill_phis(&mut self) -> Result<(), Stop> {
+        let p = self.x.p;
+        self.drain_pending_masks()?;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -11749,6 +11759,7 @@ impl<'a> Lower<'a> {
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
             self.s.m.set_phi(phi, incoming);
         }
+        self.drain_pending_masks()?;
         Ok(())
     }
 }
