@@ -1416,7 +1416,7 @@ fn build_custom_cs(threads: u32, use_lds: bool, loop_limit: u32, body: &[u32]) -
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let lowered = lower::lower_with_limit(
@@ -1607,7 +1607,7 @@ fn s_wqm_pixel_loop_and_skip_run_per_quad() {
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let lowered = lower::lower_with_limit(
@@ -2073,7 +2073,7 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let container = crate::dxbc::build(&[]);
@@ -2849,7 +2849,7 @@ fn build_lanes_cs(body: &[u32], target: super::Target) -> Result<HostShader, Str
         code,
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).map_err(|e| format!("{e:?}"))?;
-    let res = resource::track(&p, &native.layout, native.stage).map_err(|e| format!("{e:?}"))?;
+    let res = resource::track(&p, &native.layout, native.stage, None).map_err(|e| format!("{e:?}"))?;
     let io = io::raise(&p, &native).map_err(|e| format!("{e:?}"))?;
     let st = structure::structure(&p).map_err(|e| format!("{e:?}"))?;
     let container = crate::dxbc::build(&[]);
@@ -3138,7 +3138,7 @@ fn structured_access_through_a_root_uav_reaches_index_times_stride() {
         code,
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let container = crate::dxbc::build(&[]);

@@ -285,6 +285,18 @@ pub fn track(
         .iter()
         .filter_map(|d| t.root_indexed_view(d, &out.scalar))
         .collect();
+    let built = out.descriptors.iter().flat_map(|d| {
+        d.source.leaves().into_iter().filter_map(|l| match l {
+            Source::Built { address, .. } => Some(*address),
+            _ => None,
+        })
+    });
+    let addresses: Vec<Address> = out.scalar.iter().map(|s| s.1).chain(built).collect();
+    for pair in addresses.into_iter().filter_map(|a| t.pair(a)) {
+        if !out.pairs.contains(&pair) {
+            out.pairs.push(pair);
+        }
+    }
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
@@ -363,18 +375,6 @@ pub fn track(
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.push(site);
             out.waterfall.sizes.push((site, twin));
-        }
-    }
-    let built = out.descriptors.iter().flat_map(|d| {
-        d.source.leaves().into_iter().filter_map(|l| match l {
-            Source::Built { address, .. } => Some(*address),
-            _ => None,
-        })
-    });
-    let addresses: Vec<Address> = out.scalar.iter().map(|s| s.1).chain(built).collect();
-    for pair in addresses.into_iter().filter_map(|a| t.pair(a)) {
-        if !out.pairs.contains(&pair) {
-            out.pairs.push(pair);
         }
     }
     Ok(out)
@@ -3288,7 +3288,7 @@ pub(crate) mod tests {
             HwStage::Ms,
         ] {
             for user_data in [250, 255] {
-                let err = track(&p, &[param(Table, user_data, 1)], stage).unwrap_err();
+                let err = track(&p, &[param(Table, user_data, 1)], stage, None).unwrap_err();
                 assert_eq!(
                     err,
                     ShaderError::Unsupported {
@@ -3301,7 +3301,7 @@ pub(crate) mod tests {
         }
         // Wrapped, 250 + 8 named s2 and the load was claimed for the table
         // (failing later, on its high half); user data at s2 still is.
-        let err = track(&p, &[param(Table, 2, 1)], HwStage::Ps).unwrap_err();
+        let err = track(&p, &[param(Table, 2, 1)], HwStage::Ps, None).unwrap_err();
         assert_eq!(
             err,
             ShaderError::Unsupported {
@@ -3408,7 +3408,7 @@ pub(crate) mod tests {
                 .flat_map(|w| w.to_le_bytes())
                 .collect();
             let p = crate::ir::build(&code, false, 256).unwrap();
-            let err = track(&p, &[param(Constants, 0, 4)], HwStage::Cs).unwrap_err();
+            let err = track(&p, &[param(Constants, 0, 4)], HwStage::Cs, None).unwrap_err();
             assert_eq!(
                 err,
                 ShaderError::Unsupported {

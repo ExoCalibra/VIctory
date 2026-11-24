@@ -186,7 +186,7 @@ fn fixture(encoding: Encoding, op: u32, name: &str) -> Result<(NativeProgram, us
 
 fn translate(native: &NativeProgram, offset: usize) -> Result<(), (&'static str, ShaderError)> {
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).map_err(|e| ("ir", e))?;
-    let res = resource::track(&p, &native.layout, native.stage).map_err(|e| ("resource", e))?;
+    let res = resource::track(&p, &native.layout, native.stage, None).map_err(|e| ("resource", e))?;
     let io = io::raise(&p, native).map_err(|e| ("io", e))?;
     let st = structure::structure(&p).map_err(|e| ("structure", e))?;
     lower::AUDIT_OFFSET.set(Some(offset));

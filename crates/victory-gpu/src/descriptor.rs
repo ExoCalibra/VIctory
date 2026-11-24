@@ -964,7 +964,7 @@ mod tests {
         };
         let program = victory_shader::ir::build(&native.code, false, native.vgprs).unwrap();
         let resources =
-            victory_shader::resource::track(&program, &native.layout, native.stage).unwrap();
+            victory_shader::resource::track(&program, &native.layout, native.stage, None).unwrap();
         let flow = victory_shader::structure::structure(&program).unwrap();
         let io = victory_shader::io::raise(&program, &native).unwrap();
         let container = Container {

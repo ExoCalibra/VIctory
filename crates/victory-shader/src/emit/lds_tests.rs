@@ -157,7 +157,7 @@ fn build_cs(body: &[u32], threads: u32) -> HostShader {
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, None).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
     let lowered = lower::lower(&lower::Parts {

@@ -385,7 +385,7 @@ pub fn emit(
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res, target)
 }
 
@@ -930,7 +930,7 @@ mod tests {
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap();
@@ -1121,7 +1121,7 @@ mod tests {
                 code: words(case).iter().flat_map(|w| w.to_le_bytes()).collect(),
             };
             let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
             let shader = emit(&c, &native, &p, &st, &io, &res, Target::ANY);
@@ -1196,7 +1196,7 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         let container = crate::dxbc::build(&[]);
@@ -1405,7 +1405,7 @@ mod tests {
                 crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
             let c = super::Container::parse(&bytes).unwrap();
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let st = crate::structure::structure(&p).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();
@@ -1512,7 +1512,7 @@ mod tests {
             parts: vec![],
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs)?;
-        let res = crate::resource::track(&p, &native.layout, native.stage)?;
+        let res = crate::resource::track(&p, &native.layout, native.stage, None)?;
         let io = crate::io::raise(&p, native)?;
         let st = crate::structure::structure(&p)?;
         super::emit(&c, native, &p, &st, &io, &res, target)
@@ -1700,7 +1700,7 @@ mod tests {
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1), (FourCC::PSG1, &psg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         emit(&c, &native, &p, &st, &io, &res, Target::ANY)
@@ -1815,7 +1815,7 @@ mod atomic_tests {
                 &p,
                 &structure::structure(&p).unwrap(),
                 &io::raise(&p, &native).unwrap(),
-                &resource::track(&p, &native.layout, native.stage).unwrap(),
+                &resource::track(&p, &native.layout, native.stage, None).unwrap(),
                 Target::ANY,
             )
             .unwrap();
@@ -1951,7 +1951,7 @@ mod barycentric_tests {
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
-        let res = resource::track(&p, &native.layout, native.stage)?;
+        let res = resource::track(&p, &native.layout, native.stage, None)?;
         let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
         emit(&c, &native, &p, &st, &io, &res, Target::ANY)
@@ -2237,7 +2237,7 @@ mod barycentric_tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         let l = super::lower::lower(&super::lower::Parts {
@@ -2406,7 +2406,7 @@ mod barycentric_tests {
             crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         let mut host = emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap();
@@ -2474,7 +2474,7 @@ mod barycentric_tests {
             crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
         let c = super::Container::parse(&bytes).unwrap();
         let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         let emitted = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();

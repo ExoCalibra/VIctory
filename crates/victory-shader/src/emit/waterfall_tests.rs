@@ -67,6 +67,7 @@ fn build_with(words: &[u32], buffers: bool, handles: u32) -> HostShader {
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
+        psv: None,
         p: &p,
         st: &st,
         io: &io,
@@ -75,6 +76,9 @@ fn build_with(words: &[u32], buffers: bool, handles: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
     // Accesses with each lane's own heap index, no wave operation.
@@ -88,6 +92,9 @@ fn build_with(words: &[u32], buffers: bool, handles: u32) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: Vec::new(),
+        address_srvs: lowered.address_srvs,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -136,11 +143,15 @@ fn run_on(
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
         };
-        // Both tables start at heap index 0.
+        // Both tables start at heap index 0; the guard slot holds the heap size.
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            assert_eq!(u.root, RootType::Table, "{u:?}");
-            ud[u.index as usize] = 0;
+            match u.root {
+                RootType::Table => ud[u.index as usize] = 0,
+                RootType::ResourceHeap => ud[u.index as usize] = views.len() as u32,
+                RootType::SamplerHeap => ud[u.index as usize] = samplers.len() as u32,
+                _ => panic!("unexpected user data: {u:?}"),
+            }
         }
         let words = host
             .dispatch(
