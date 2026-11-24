@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::{AddressView, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
@@ -254,6 +255,23 @@ fn root_view_len(shadow: &crate::shadow::Shadow, address: u64, srv: bool) -> u64
     shadow
         .left(address)
         .min(if srv { 1 << 20 } else { 1 << 16 })
+}
+
+/// Addresses below this are taken as unset (null, or no buffer): a root SRV
+/// at an address in root constants is not bound there and its draw is
+/// dropped.
+const MIN_ADDRESS: u64 = 0x1_0000;
+
+/// The address a root SRV at an address in root constants starts at: the
+/// two constants' current values, low half first. `None` when the title has
+/// not set either or the address is below [`MIN_ADDRESS`].
+fn pair_address(roots: &[Root], view: &AddressView) -> Option<u64> {
+    let half = |u: &UserData| match roots.get(usize::from(u.slot))? {
+        Root::Constants(c) => c.get(u.dword as usize).copied(),
+        _ => None,
+    };
+    let address = u64::from(half(&view.lo)?) | u64::from(half(&view.hi)?) << 32;
+    (address >= MIN_ADDRESS).then_some(address)
 }
 
 macro_rules! once {
@@ -683,9 +701,11 @@ impl State {
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
+    /// not be made, or a root SRV at an address in root constants has no
+    /// address to bind.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         self.depth_sampled = false;
+        let mut bound = true;
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -874,8 +894,29 @@ impl State {
                     }
                 }
             }
+            for &(view, param) in &stage.address_srvs {
+                let gpu = pair_address(self.roots_ref(compute), &view)
+                    .and_then(|address| root_view(list, address, RootView::Srv));
+                let Some(gpu) = gpu else {
+                    once!(
+                        slot = view.lo.slot,
+                        dword = view.lo.dword,
+                        "a shader reads through an address in root constants that is unset; draw dropped"
+                    );
+                    bound = false;
+                    continue;
+                };
+                // SAFETY: an open list; the address is in live memory.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
         }
-        true
+        bound
     }
 
     /// Runs a dispatch on the host.
@@ -916,12 +957,15 @@ impl State {
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            self.frame_op_why(
-                &format!("dispatch {x}x{y}x{z}"),
-                true,
-                false,
-                Some("a table it reads could not be made"),
-            );
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                self.frame_op_why(
+                    &format!("dispatch {x}x{y}x{z}"),
+                    true,
+                    false,
+                    Some("a table or address it reads could not be bound"),
+                );
+            }
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1016,6 +1060,16 @@ impl State {
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
                 }
+            }
+            for (view, _) in &stage.address_srvs {
+                let address = pair_address(self.roots_ref(compute), view);
+                let host =
+                    address.and_then(|a| crate::shadow::find(a, 1).map(|s| (s.gpu(a), s.left(a))));
+                let _ = write!(
+                    text,
+                    " u{}:u{}={address:#x?} host {host:#x?}",
+                    view.lo.index, view.hi.index
+                );
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
@@ -3022,5 +3076,66 @@ mod lease_tests {
         let mut last = State::default();
         assert_eq!(last.take_dynamic(&heap, key, total), None);
         assert!(!reset.lease().is_lost());
+    }
+}
+
+#[cfg(test)]
+mod address_srv_tests {
+    use super::*;
+
+    fn half(slot: u8, dword: u32) -> UserData {
+        UserData {
+            index: 0,
+            slot,
+            root: RootType::Constants,
+            dword,
+        }
+    }
+
+    /// The low half at dword 1 of root parameter 0, the high half at dword 0
+    /// of parameter 2.
+    fn view() -> AddressView {
+        AddressView {
+            lo: half(0, 1),
+            hi: half(2, 0),
+        }
+    }
+
+    fn roots(lo: u32, hi: u32) -> Vec<Root> {
+        vec![
+            Root::Constants(vec![7, lo]),
+            Root::None,
+            Root::Constants(vec![hi]),
+        ]
+    }
+
+    #[test]
+    fn addresses_in_root_constants_are_composed_from_both_halves() {
+        assert_eq!(
+            pair_address(&roots(0x2345_0000, 1), &view()),
+            Some(0x1_2345_0000)
+        );
+        assert_eq!(pair_address(&roots(0x1_0000, 0), &view()), Some(0x1_0000));
+    }
+
+    #[test]
+    fn an_address_with_a_missing_half_is_unset() {
+        let set = roots(0x2345_0000, 1);
+        assert_eq!(pair_address(&set[..2], &view()), None);
+        let mut no_high = set.clone();
+        no_high[2] = Root::Constants(Vec::new());
+        assert_eq!(pair_address(&no_high, &view()), None);
+        let mut not_constants = set.clone();
+        not_constants[0] = Root::View(0x1_0000_0000);
+        assert_eq!(pair_address(&not_constants, &view()), None);
+        let mut short = set;
+        short[0] = Root::Constants(vec![7]);
+        assert_eq!(pair_address(&short, &view()), None);
+    }
+
+    #[test]
+    fn null_and_low_addresses_are_unset() {
+        assert_eq!(pair_address(&roots(0, 0), &view()), None);
+        assert_eq!(pair_address(&roots(0xFFFF, 0), &view()), None);
     }
 }

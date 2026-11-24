@@ -140,7 +140,8 @@ fn lower_test_shader(native: &NativeProgram, parts: &[(crate::FourCC, &[u8])]) -
     let res = resource::track(&p, &native.layout, native.stage).unwrap();
     let io = io::raise(&p, native).unwrap();
     let st = structure::structure(&p).unwrap();
-    let shader = super::emit(&container, native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
+    let shader =
+        super::emit(&container, native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -2070,19 +2071,26 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
         // Root parameter 0 is user data; sorted root views follow at 1 (CBV 0), 2 (SRV 1), 3 (UAV 2).
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Descriptor {
+                ud[u.index as usize] = 16;
+            }
+        }
         let out = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
                     roots: vec![
-                        (0, Root::Constants(vec![0; 4])),
+                        (0, Root::Constants(ud)),
                         (
                             1,
                             Root::View {
@@ -2110,6 +2118,66 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
             &[0xCAFE_BEEF, 0x1011, 0x1000 ^ 0xCAFE_BEEF],
             "{label}: unexpected Root UAV readback"
         );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A global load through an address the title passes as two root constants
+/// (`s[2:3]`) reads the root SRV the host binds at that address: `t0` in
+/// `ROOT_ADDRESS_SPACE`, the root parameter after the user data.
+#[test]
+fn global_loads_through_a_root_constant_pair_read_its_root_srv() {
+    let shader = build_valu_cs(&[
+        vop1(0x001, 5, 128 + 8), // v_mov_b32 v5, 8
+        0xDC30_8004,
+        0x0002_0005, // global_load_dword v0, v5, s[2:3] offset:4
+    ]);
+    assert!(shader.root_srvs.is_empty());
+    let [view] = shader.address_srvs[..] else {
+        panic!("{:?}", shader.address_srvs)
+    };
+    assert_eq!((view.lo.dword, view.hi.dword), (2, 3));
+    let data: Vec<u32> = (0..8).map(|k| 0x100 + k).collect();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        // The constants hold an address the host does not use: it binds the
+        // buffer itself.
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Constants {
+                ud[u.index as usize] = 0x1_0000 * (u.dword + 1);
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: data.clone(),
+                            },
+                        ),
+                    ],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0][0], data[3], "{label}: byte 12 of the buffer");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

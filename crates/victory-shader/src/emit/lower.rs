@@ -8,10 +8,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
+use super::{AddressView, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -98,6 +98,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub address_srvs: Vec<AddressView>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Back edges that count against the spin-wait limit.
@@ -549,6 +550,9 @@ struct Lower<'a> {
     /// Bytes each root view holds, by root parameter (see [`Self::root_view_size`]).
     root_sizes: HashMap<usize, V>,
     samplers: Vec<[u32; 4]>,
+    /// Root SRVs at addresses in root constants, in the order of the
+    /// shader's `address_srvs`.
+    address_views: Vec<AddressView>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     /// Precomputed descriptor use site (`(use_site, first)`) by exact load site,
     /// preferring rich (image / vector buffer) uses.
@@ -1446,6 +1450,7 @@ impl<'a> Lower<'a> {
             user_reads: BTreeMap::new(),
             root_sizes: HashMap::new(),
             samplers: Vec::new(),
+            address_views: Vec::new(),
             descriptors: x
                 .res
                 .descriptors
@@ -2396,6 +2401,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            address_srvs: self.address_views,
             #[cfg(test)]
             spin_loops: self.spun,
             #[cfg(test)]
@@ -5745,6 +5751,9 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if self.scalar.get(&site).is_some_and(|a| self.in_constants(a)) {
+            return Err("a scalar load through an address in root constants");
+        }
         let root_desc = self.scalar.get(&site).copied().and_then(|a| {
             (self.x.native.layout.get(a.param)?.root == RootType::Descriptor).then_some(
                 Source::Built {
@@ -5812,10 +5821,18 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if let Some(u) = kind
-            && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+        let on_pair = matches!(src, Source::Built { address, .. } if self.in_constants(address));
+        if on_pair
+            || matches!(
+                kind,
+                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+            )
         {
-            let u_bit = if u.kind == ResourceType::Uav { 0x1000 } else { 0 };
+            let u_bit = if matches!(kind, Some(u) if u.kind == ResourceType::Uav) {
+                0x1000
+            } else {
+                0
+            };
             // Scalar buffer loads address bytes, even when the descriptor carries a stride.
             let h = self.handle(site, src, false, (11 | u_bit, 0))?;
             let elem_off = self.s.m.undef(self.s.t.i32);
@@ -6383,6 +6400,44 @@ impl<'a> Lower<'a> {
         Ok((h, ok, safe_idx, safe_off))
     }
 
+    /// `a` starts from a root-constant pair.
+    fn in_constants(&self, a: &Address) -> bool {
+        self.x
+            .native
+            .layout
+            .get(a.param)
+            .is_some_and(|rp| rp.root == RootType::Constants)
+    }
+
+    /// The handle of the root SRV at the address the root-constant pair
+    /// that `a` starts from holds.
+    fn address_srv(&mut self, a: &Address) -> Result<V, Why> {
+        let pair = self
+            .x
+            .res
+            .pairs
+            .iter()
+            .find(|p| p.lo == (a.param, a.dword))
+            .ok_or("an address in root constants without its high half")?;
+        let half = |(param, dword): (usize, u32)| {
+            let rp = self.x.native.layout[param];
+            UserData {
+                index: u32::from(rp.user_data) + dword,
+                slot: rp.slot,
+                root: rp.root,
+                dword,
+            }
+        };
+        let view = AddressView {
+            lo: half(pair.lo),
+            hi: half(pair.hi),
+        };
+        if !self.address_views.contains(&view) {
+            self.address_views.push(view);
+        }
+        Ok(self.s.address_srv_handle(view.lo.index))
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -6469,6 +6524,12 @@ impl<'a> Lower<'a> {
                     .layout
                     .get(address.param)
                     .ok_or("a descriptor built around a table in the code")?;
+                if rp.root == RootType::Constants {
+                    return match props.0 {
+                        11 => self.address_srv(address),
+                        _ => Err("a write or typed view through an address in root constants"),
+                    };
+                }
                 let kind = self
                     .x
                     .native
