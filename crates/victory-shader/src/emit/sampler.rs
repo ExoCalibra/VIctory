@@ -83,6 +83,19 @@ impl StaticSampler {
             max_lod,
         }
     }
+
+    /// The same sampler for a comparison instruction (`image_sample_c*`).
+    /// `D3D12_FILTER_REDUCTION_TYPE` (bits 7-8) holds one of filtering,
+    /// comparison, minimum or maximum, so comparison replaces the reduction
+    /// the sampler words give: setting bit 7 alone would turn minimum (2)
+    /// into maximum (3) and leave maximum without comparison, a filter the
+    /// shader's comparison sampler declaration does not match.
+    pub fn comparison(self) -> Self {
+        StaticSampler {
+            filter: self.filter & !(3 << 7) | 1 << 7,
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +159,34 @@ mod tests {
         assert_eq!(bias(0x3000), -16.0, "-16 is kept");
         assert_eq!(bias(0x0E80), 14.5, "in range is kept");
         assert_eq!(bias(0x3F80), -0.5, "negative in range is kept");
+    }
+
+    /// Comparison takes the reduction field whatever the sampler words
+    /// asked for; the filter bits beside it are kept.
+    #[test]
+    fn comparison_replaces_the_reduction() {
+        let filter = |w0: u32, w2: u32| {
+            StaticSampler::from_words([w0, 0, w2, 0])
+                .comparison()
+                .filter
+        };
+        // Point, linear min/mag with linear mip, anisotropic.
+        assert_eq!(filter(0, 0), 0x80);
+        assert_eq!(filter(0, 0x0850_0000), 0x95);
+        assert_eq!(filter(0, 0x00F0_0000), 0xD5);
+        // Minimum (reduction 1) and maximum (2) reductions become comparison.
+        assert_eq!(filter(0x2000_0000, 0x0850_0000), 0x95, "minimum");
+        assert_eq!(filter(0x4000_0000, 0x0850_0000), 0x95, "maximum");
+        assert_eq!(filter(0x4000_0000, 0x00F0_0000), 0xD5, "maximum aniso");
+        // Everything else is unchanged.
+        let s = StaticSampler::from_words([0x2000_3088, 0x0054_0100, 0x1400_0080, 0x8000_0000]);
+        assert_eq!(
+            StaticSampler {
+                filter: s.filter,
+                ..s.comparison()
+            },
+            s
+        );
     }
 
     /// The LOD fields are independent; a maximum below the minimum is raised

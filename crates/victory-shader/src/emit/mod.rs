@@ -396,11 +396,12 @@ fn emit_program(
             .iter()
             .enumerate()
             .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
+                let s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.comparison()
+                } else {
+                    s
                 }
-                s
             })
             .collect(),
         samplers: l.samplers,
