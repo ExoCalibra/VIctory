@@ -1599,8 +1599,13 @@ float4 ps(V input) : SV_Target { return input.color; }
                     static_samplers: Vec::new(),
                     root_cbvs: Vec::new(),
                     root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    root_indexed_views: Vec::new(),
+                    address_srvs: Vec::new(),
                 },
                 used: Vec::new(),
+                resource_heap: false,
+                writes_memory: false,
             }));
             shader
         };
@@ -1690,7 +1695,7 @@ float4 ps(V input) : SV_Target { return input.color; }
         }
         let target: ID3D12Resource = target.unwrap();
         let list = host.new_list().unwrap();
-        let rtv = host.rtv(&target, None);
+        let rtv = host.rtv(Some(&target), None);
         let mut state = crate::draw::State::default();
         state.set_pipeline(pipeline);
         state.set_topology(&list, topology);

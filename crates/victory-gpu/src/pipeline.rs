@@ -115,7 +115,11 @@ pub(crate) fn compute_for_test(translated: Translated) -> host::HostPipeline {
         stage: "compute",
         hash: "synthetic readback".into(),
         container: Vec::new(),
-        translated: OnceLock::from(Some(translated)),
+        translated: [
+            OnceLock::from(Some(translated)),
+            OnceLock::new(),
+            OnceLock::new(),
+        ],
     });
     host::HostPipeline::new(&[shader], None).expect("readback pipeline")
 }
@@ -734,7 +738,7 @@ pub(crate) fn test_compute_pipeline(
         stage: "compute",
         hash,
         container: Vec::new(),
-        translated,
+        translated: [translated, OnceLock::new(), OnceLock::new()],
     });
     let mut out = std::ptr::null();
     assert_eq!(

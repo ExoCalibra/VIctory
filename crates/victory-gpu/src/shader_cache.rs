@@ -452,9 +452,13 @@ mod tests {
             lanes_min: 32,
             lanes_max: 64,
         };
-        assert_eq!(key(&build, nvidia), key(&build, nvidia));
-        assert_ne!(key(&build, nvidia), key(&build, rdna));
-        assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
+        assert_eq!(key(&build, None, nvidia), key(&build, None, nvidia));
+        assert_ne!(key(&build, None, nvidia), key(&build, None, rdna));
+        assert_ne!(key(&build, None, nvidia), key(&[8; 32], None, nvidia));
+        assert_ne!(
+            key(&build, None, nvidia),
+            key(&build, Some(HwStage::Es), nvidia)
+        );
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

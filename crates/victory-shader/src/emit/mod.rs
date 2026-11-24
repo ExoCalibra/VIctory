@@ -1361,7 +1361,7 @@ mod tests {
             let st = structure::structure(&p).unwrap();
             let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = io::raise(&p, &native).unwrap();
-            emit(&c, &native, &p, &st, &io, &res).unwrap()
+            emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap()
         };
         let own_ring = [
             vop3(0x365, 4, 193, 128, 0),   // v_mbcnt_lo_u32_b32 v4, -1, 0
@@ -1410,6 +1410,9 @@ mod tests {
             static_samplers: vec![],
             root_cbvs: vec![],
             root_srvs: vec![],
+            root_uavs: vec![],
+            root_indexed_views: vec![],
+            address_srvs: vec![],
         };
 
         let mut gs_words = own_ring;
