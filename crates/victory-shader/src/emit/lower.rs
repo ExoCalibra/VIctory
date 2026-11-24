@@ -803,18 +803,29 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
-/// SCC of each scalar operation writing a tracked lane mask, with the
-/// mask's low dword (EXEC's new value for the `saveexec` forms).
+/// SCC of each scalar operation writing a tracked lane mask (or `s_bcnt1`
+/// testing whether any bit of a tracked lane mask is set), with the mask's
+/// low dword (EXEC's new value for the `saveexec` forms).
 fn mask_sccs(st: &Structured, p: &crate::ir::Program) -> HashMap<Value, Value> {
     let mut out = HashMap::new();
     for inst in p.blocks.iter().flat_map(|b| &b.insts) {
-        let Fields::Sop { dst, .. } = &inst.fields else {
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
             continue;
         };
         let Some(scc) = inst.write(Reg::Scc) else {
             continue;
         };
-        let lo = if inst.name().contains("saveexec") {
+        let bcnt = if p.wave64 {
+            "s_bcnt1_i32_b64"
+        } else {
+            "s_bcnt1_i32_b32"
+        };
+        let lo = if inst.name() == bcnt {
+            match src.first() {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => inst.read(Reg::S(code)),
+                _ => None,
+            }
+        } else if inst.name().contains("saveexec") {
             inst.write(Reg::S(EXEC))
         } else {
             match *dst {
@@ -2844,12 +2855,21 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn is_mask_value(&self, v: Value) -> bool {
+        self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)
+    }
+
+    fn mask_scc_source(&self, why: Why, v: Value) -> Option<Value> {
+        let can = self.mask_ok || why == LANE_MASK;
+        can.then(|| self.mask_scc.get(&v).copied()).flatten()
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
-        let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        let is_mask = self.is_mask_value(v);
         if let Some(&(val, h)) = self.finals.get(&v)
             && !self.loop_bodies[&h].contains(&self.cur_ir)
         {
@@ -2862,16 +2882,17 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(_)) if self.mask_ok && self.mask_scc.contains_key(&v) => {
-                let lo = self.mask_scc[&v];
-                return self.mask_any(lo).map(Val::Bit);
-            }
             // A mask's number (from a set operation) only for the uses
             // `MaskData` allows.
             Some(&Val::I32(_)) if is_mask && !self.mask_ok && !self.phi_at.contains_key(&v) => {
                 return Err(LANE_MASK);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                if let Some(lo) = self.mask_scc_source(w, v) {
+                    return self.mask_any(lo).map(Val::Bit);
+                }
+                return Err(w);
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -3175,18 +3196,23 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether some lane of the mask with low dword `lo` is set, as data
-    /// (SCC of the operation writing it): its ballot is not zero.
+    /// (SCC of the operation writing it or `s_bcnt1`): its ballot is not zero.
     fn mask_any(&mut self, lo: Value) -> Result<V, Why> {
+        self.mask_any_in(self.cur, lo)
+    }
+
+    /// Emits [`Self::mask_any`] into DXIL block `at` (while `self.cur` holds the
+    /// block where any local ballot for `self.cur_ir` belongs).
+    fn mask_any_in(&mut self, at: usize, lo: Value) -> Result<V, Why> {
         let x = self.mask_dword(lo)?;
         let (_, y) = self.ballots[&lo];
-        let c = self.cur;
         let any = if self.x.p.wave64 {
-            self.s.m.bin(c, Bin::Or, x, y)
+            self.s.m.bin(at, Bin::Or, x, y)
         } else {
             x
         };
         let z = self.s.m.i32(0);
-        Ok(self.s.m.cmp(c, pred::NE, any, z))
+        Ok(self.s.m.cmp(at, pred::NE, any, z))
     }
 
     // ---- operands ----
@@ -7674,7 +7700,7 @@ impl<'a> Lower<'a> {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Uav) | None, p)
-                        if p == 11 | 0x1000 =>
+                        if p & !GLOBALLY_COHERENT_PROP == 11 | UAV_PROP =>
                     {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }
@@ -9951,6 +9977,7 @@ impl<'a> Lower<'a> {
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
+            let live = self.read_phis.contains(&phi.value);
             // A register initialized only on one branch may carry a dead
             // descriptor dword left over from earlier register reuse on the
             // other branch (guarded by a separate predicate). Only treat a
@@ -9963,14 +9990,25 @@ impl<'a> Lower<'a> {
                     .enumerate()
                     .filter(|&(_, &q)| self.tail[q].is_some())
                     .any(|(n, _)| matches!(self.vals.get(&phi.args[n]), Some(Val::I32(_))));
+            let has_non_mask_data = !bit
+                && !self.is_mask_value(phi.value)
+                && p.blocks[b]
+                    .preds
+                    .iter()
+                    .zip(&phi.args)
+                    .any(|(&q, &a)| {
+                        self.tail[q].is_some()
+                            && !self.is_mask_value(a)
+                            && matches!(self.vals.get(&a), Some(Val::I32(_)))
+                    });
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let Some(tail_q) = self.tail[q] else { continue };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(tail_q);
                 let arg = phi.args[n];
                 let mut is_bary = false;
                 let mut overwritten_bary = false;
-                if !bit && self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                if !bit && live && !self.vals.contains_key(&arg) {
                     is_bary = self
                         .x
                         .io
@@ -10002,13 +10040,12 @@ impl<'a> Lower<'a> {
                         self.s.m.i32(0)
                     }
                     (Some(Val::Missing(_)), false)
-                        if self.read_phis.contains(&phi.value)
-                            && self.overwritten_movreld_edge(b, phi, n).is_some() =>
+                        if live && self.overwritten_movreld_edge(b, phi, n).is_some() =>
                     {
                         self.s.m.undef(self.s.t.i32)
                     }
                     (None, false) if overwritten_bary && is_bary => self.s.m.undef(self.s.t.i32),
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Bit(_)), false) if live => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
                     // A descriptor's dwords reaching a join that also takes
@@ -10022,7 +10059,26 @@ impl<'a> Lower<'a> {
                             self.s.m.undef(self.s.t.i32)
                         }
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    // A dead lane-mask dword reaching a join that also takes
+                    // data (registers reused after the mask died): undefined on
+                    // that edge, assuming reads come only from the data path.
+                    (Some(Val::Missing(_)), false)
+                        if live && has_non_mask_data && self.is_mask_value(arg) =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
+                    (Some(Val::Missing(why)), true) if live => {
+                        let Some(lo) = self.mask_scc_source(why, arg) else {
+                            return Err(Stop::Retry(phi.value, why));
+                        };
+                        let saved_ir = std::mem::replace(&mut self.cur_ir, q);
+                        let saved_cur = std::mem::replace(&mut self.cur, tail_q);
+                        let res = self.mask_any_in(qb, lo);
+                        self.cur = saved_cur;
+                        self.cur_ir = saved_ir;
+                        res.map_err(|w| Stop::Retry(phi.value, w))?
+                    }
+                    (Some(Val::Missing(why)), _) if live => {
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if self.read_phis.contains(&phi.value) => {

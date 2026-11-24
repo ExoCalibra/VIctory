@@ -345,6 +345,7 @@ impl Module {
                 V::Global(i) => format!("g{i}"),
                 V::Const(i) => match &m.consts[i as usize].1 {
                     Const::Int(n) => format!("k{n}"),
+                    Const::Undef => "undef".into(),
                     _ => format!("c{i}"),
                 },
             }
@@ -359,6 +360,14 @@ impl Module {
                     format!("select {} {} {}", v(self, *c), v(self, *t), v(self, *f))
                 }
                 Op::Extract(a, i) => format!("extract {} {i}", v(self, *a)),
+                Op::Phi(incoming) => {
+                    let args = incoming
+                        .iter()
+                        .map(|&(x, b)| format!("({}, b{b})", v(self, x)))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("phi [{args}]")
+                }
                 Op::Call(f, args) => {
                     let args = args
                         .iter()
