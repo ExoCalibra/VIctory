@@ -1964,6 +1964,41 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 };
 
 #[cfg(test)]
+pub(crate) fn test_texture_at(
+    address: u64,
+    width: u64,
+    height: u32,
+    format: u32,
+    flags: u32,
+) -> This {
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_at_address(
+        std::ptr::null(),
+        address,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
+
+#[cfg(test)]
 pub(crate) fn test_buffer(width: u64) -> This {
     let heap = HeapProperties {
         kind: 1,
