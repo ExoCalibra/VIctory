@@ -277,6 +277,27 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
+/// Pipelines skipped because a translated shader requires a wave lane count
+/// outside the host device's supported range.
+static WAVE_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a host device supporting `device` (`min..=max` lanes) can run a
+/// shader declaring `required` (`min..=max` lanes) in `PSV0`.
+fn wave_lanes_supported(required: (u32, u32), device: (u32, u32)) -> bool {
+    let (req_min, req_max) = required;
+    let (dev_min, dev_max) = device;
+    if dev_max == 0 {
+        return false;
+    }
+    let lo = req_min.max(dev_min);
+    let hi = if req_max == 0 {
+        dev_max
+    } else {
+        req_max.min(dev_max)
+    };
+    lo <= hi
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -327,6 +348,29 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        if let Some(device_waves) = host.wave_lane_range() {
+            for &(shader, _) in &stages {
+                if let Some(required) = shader.translated()?.host.wave_size_range()
+                    && !wave_lanes_supported(required, device_waves)
+                {
+                    let skipped =
+                        WAVE_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        ?shaders,
+                        required_wave_min = required.0,
+                        required_wave_max = required.1,
+                        device_wave_min = device_waves.0,
+                        device_wave_max = device_waves.1,
+                        skipped,
+                        "host pipeline skipped: shader requires {}-lane waves, device supports {}..={}",
+                        required.0,
+                        device_waves.0,
+                        device_waves.1,
+                    );
+                    return None;
+                }
+            }
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -663,5 +707,36 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wave_lane_compatibility_matches_device_range() {
+        // NVIDIA (32-lane fixed): accepts 32, refuses 64.
+        assert!(wave_lanes_supported((32, 32), (32, 32)));
+        assert!(!wave_lanes_supported((64, 64), (32, 32)));
+        assert!(wave_lanes_supported((32, u32::MAX), (32, 32)));
+        // AMD RDNA (32..=64): accepts both 32 and 64.
+        assert!(wave_lanes_supported((32, 32), (32, 64)));
+        assert!(wave_lanes_supported((64, 64), (32, 64)));
+        // Intel (8..=32): accepts 16 and 32, refuses 64.
+        assert!(wave_lanes_supported((16, 16), (8, 32)));
+        assert!(!wave_lanes_supported((64, 64), (8, 32)));
+        // Degenerate zero max range rejects everything.
+        assert!(!wave_lanes_supported((32, 32), (0, 0)));
+    }
+
+    #[test]
+    fn host_reports_valid_wave_lane_range_when_device_present() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if let Some((min, max)) = host.wave_lane_range() {
+            assert!(min > 0 && min <= max, "invalid wave range {min}..={max}");
+        }
     }
 }

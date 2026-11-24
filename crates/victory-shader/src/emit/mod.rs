@@ -170,6 +170,27 @@ impl HostShader {
             .unwrap_or(0);
         n.next_multiple_of(4)
     }
+
+    /// The `(min, max)` wave lane counts declared in the emitted container's
+    /// `PSV0` part, or `None` when the shader places no wave-size requirement.
+    pub fn wave_size_range(&self) -> Option<(u32, u32)> {
+        let c = Container::parse(&self.dxil).ok()?;
+        let psv = c.part(FourCC::PSV0)?.data;
+        if psv.len() < 28 {
+            return None;
+        }
+        let info_size = u32::from_le_bytes(psv[0..4].try_into().ok()?) as usize;
+        if info_size < 24 || psv.len() < 4 + 24 {
+            return None;
+        }
+        let min = u32::from_le_bytes(psv[20..24].try_into().ok()?);
+        let max = u32::from_le_bytes(psv[24..28].try_into().ok()?);
+        if min == 0 && (max == 0 || max == u32::MAX) {
+            None
+        } else {
+            Some((min, max))
+        }
+    }
 }
 
 /// One dword of user data and the root parameter that fills it.
@@ -745,5 +766,34 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn wave_size_range_reads_psv0_bounds() {
+        let with_wave = |wave_size: Option<u32>| {
+            let psv = super::container::psv(&super::container::Psv {
+                stage: 5,
+                flag: false,
+                inputs: &[],
+                outputs: &[],
+                prims: &[],
+                mesh: None,
+                bindings: &[],
+                threads: [64, 1, 1],
+                wave_size,
+            });
+            super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil: crate::dxbc::build(&[(super::FourCC::PSV0, &psv)]),
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            }
+        };
+        assert_eq!(with_wave(None).wave_size_range(), None);
+        assert_eq!(with_wave(Some(32)).wave_size_range(), Some((32, 32)));
+        assert_eq!(with_wave(Some(64)).wave_size_range(), Some((64, 64)));
     }
 }

@@ -449,6 +449,30 @@ impl Host {
         })
     }
 
+    /// The host device's supported `(min, max)` wave lane counts from
+    /// `D3D12_FEATURE_D3D12_OPTIONS1`, logged once; `None` if wave ops are
+    /// unsupported or the query fails.
+    pub(crate) fn wave_lane_range(&self) -> Option<(u32, u32)> {
+        static WAVES: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+        *WAVES.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: `options` matches `D3D12_FEATURE_D3D12_OPTIONS1` and its byte size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let range = (ok && options.WaveOps.as_bool() && options.WaveLaneCountMax > 0)
+                .then_some((options.WaveLaneCountMin, options.WaveLaneCountMax));
+            tracing::info!(?range, "host wave lane count range");
+            range
+        })
+    }
+
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
