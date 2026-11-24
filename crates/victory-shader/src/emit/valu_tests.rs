@@ -2123,16 +2123,12 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// A global load through an address the title passes as two root constants
-/// (`s[2:3]`) reads the root SRV the host binds at that address: `t0` in
-/// `ROOT_ADDRESS_SPACE`, the root parameter after the user data.
-#[test]
-fn global_loads_through_a_root_constant_pair_read_its_root_srv() {
-    let shader = build_valu_cs(&[
-        vop1(0x001, 5, 128 + 8), // v_mov_b32 v5, 8
-        0xDC30_8004,
-        0x0002_0005, // global_load_dword v0, v5, s[2:3] offset:4
-    ]);
+/// Runs `body` with an address in root constants (`s[2:3]`) and a root SRV
+/// bound for it (`t0` in `ROOT_ADDRESS_SPACE`, the root parameter after the
+/// user data) holding `0x100 + k` in dword `k`; checks that `v0` ends up
+/// holding dword 3.
+fn reads_dword_3_through_a_root_constant_pair(body: &[u32]) {
+    let shader = build_valu_cs(body);
     assert!(shader.root_srvs.is_empty());
     let [view] = shader.address_srvs[..] else {
         panic!("{:?}", shader.address_srvs)
@@ -3073,4 +3069,25 @@ fn structured_access_through_a_root_uav_reaches_index_times_stride() {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A global load through an address the title passes as two root constants
+/// reads the root SRV the host binds at that address.
+#[test]
+fn global_loads_through_a_root_constant_pair_read_its_root_srv() {
+    reads_dword_3_through_a_root_constant_pair(&[
+        vop1(0x001, 5, 128 + 8), // v_mov_b32 v5, 8
+        0xDC30_8004,
+        0x0002_0005, // global_load_dword v0, v5, s[2:3] offset:4
+    ]);
+}
+
+/// A scalar load through the same address reads it too.
+#[test]
+fn scalar_loads_through_a_root_constant_pair_read_its_root_srv() {
+    reads_dword_3_through_a_root_constant_pair(&[
+        0xF400_0181,
+        0xFA00_000C,             // s_load_dword s6, s[2:3], 0xc
+        vop1(0x001, 0, sgpr(6)), // v_mov_b32 v0, s6
+    ]);
 }

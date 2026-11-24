@@ -1518,7 +1518,12 @@
             0xFA00_0000, // s_buffer_load_dword s6, s[12:15], null
             0x7E00_0206, // v_mov_b32 v0, s6
         ]);
-        for body in [&global[..], &scalar] {
+        let scalar_load = [
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            0x7E00_0206, // v_mov_b32 v0, s6
+        ];
+        for body in [&global[..], &scalar, &scalar_load] {
             let (views, root_srvs) = lowers_with_constants(body).unwrap();
             assert_eq!(views, [view]);
             assert!(root_srvs.is_empty());
@@ -1531,14 +1536,6 @@
             Err(crate::ShaderError::Unsupported { what, .. }) => what,
             other => panic!("{:?}", other.map(|_| ())),
         };
-        assert_eq!(
-            reason(&[
-                0xF400_0181,
-                0xFA00_0000, // s_load_dword s6, s[2:3], null
-                0x7E00_0206, // v_mov_b32 v0, s6
-            ]),
-            "a scalar load through an address in root constants"
-        );
         let mut typed = BUILT_ON_THE_PAIR.to_vec();
         typed.extend([
             0xE000_2000,
