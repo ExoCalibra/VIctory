@@ -1447,11 +1447,12 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&(resource, _)| crate::resource::host_resource(resource as This))
-            .map(|t| {
+            .filter_map(|&(resource, _)| {
+                let resource = resource as This;
+                let texture = crate::resource::host_resource(resource)?;
                 // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                let d = unsafe { texture.GetDesc() };
+                Some(format!("{}x{} f{} {resource:?}", d.Width, d.Height, d.Format.0))
             })
             .collect();
         let v = self.vertex[0];

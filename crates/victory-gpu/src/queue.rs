@@ -310,7 +310,9 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     let shown = crate::capture::shown(frame);
     #[cfg(all(windows, feature = "diagnostics"))]
-    if crate::capture::listed(frame) {
+    let listed = crate::capture::listed(frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if listed {
         crate::capture::dump_targets(frame);
     }
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -329,17 +331,35 @@ extern "system" fn present(
         // SAFETY: the title passes `planes` plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
         let mut resources = Vec::with_capacity(slice.len());
-        for plane in slice {
+        for (plane_index, plane) in slice.iter().enumerate() {
             if plane.count == 0 || plane.resources.is_null() {
                 continue;
             }
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
             if let Some(texture) = crate::resource::host_resource(resource) {
+                #[cfg(feature = "diagnostics")]
+                if listed {
+                    // SAFETY: a live resource.
+                    let desc = unsafe { texture.GetDesc() };
+                    crate::capture::present_source(
+                        frame,
+                        plane_index,
+                        resources.len(),
+                        resource,
+                        &desc,
+                    );
+                }
                 let state = crate::resource::host_transition(resource, COPY_SOURCE)
                     .map_or(COPY_SOURCE, |(_, before)| before);
                 resources.push((resource, texture, state));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = plane_index;
+        }
+        #[cfg(feature = "diagnostics")]
+        if listed {
+            tracing::info!(frame, planes, sources = resources.len(), "present plane selection");
         }
         #[cfg(feature = "diagnostics")]
         let fallback_1440p = crate::capture::take_1440p_target();
