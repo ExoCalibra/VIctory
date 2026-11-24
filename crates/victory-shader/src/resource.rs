@@ -1331,7 +1331,8 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane, self.p.wave64)?;
+        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
             .ok()
             .flatten()
     }
@@ -1365,7 +1366,7 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        if lane_of(*at, self.p.wave64).ok_or(())? != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -1381,13 +1382,17 @@ impl Tracer<'_> {
     }
 }
 
-/// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
-    match op {
+/// A lane select given as a constant, as the hardware takes it: only its
+/// low 5 (wave32) or 6 (wave64) bits, so lane 35 of a wave32 is lane 3.
+/// Compared unmasked, a write to lane 35 would not be seen to replace the
+/// one to lane 3, and a read of lane 3 would trace the older SGPR.
+fn lane_of(op: Operand, wave64: bool) -> Option<u32> {
+    let lane = match op {
         Operand::Const(c) => inline(c),
         Operand::Literal(x) => Some(x),
         _ => None,
-    }
+    }?;
+    Some(lane & if wave64 { 63 } else { 31 })
 }
 
 /// What dword `k` of a move's result copies.
@@ -1612,6 +1617,29 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    /// A lane select keeps only the bits the wave has lanes for: a spill to
+    /// lane 35 of a wave32 overwrites lane 3, so lane 3 then holds s10.
+    #[test]
+    fn a_spill_lane_past_the_wave_wraps_as_the_hardware_does() {
+        let r = track_words(
+            &[
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD761_0000,
+                0x0001_460A, // v_writelane_b32 v0, s10, 35 (lane 3)
+                0xD760_0002,
+                0x0001_0700, // v_readlane_b32 s2, v0, 3
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1), param(Table, 10, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 4), at(1, 0x20))]);
     }
 
     #[test]
