@@ -376,10 +376,17 @@ fn create_staging(
     memory: *const u8,
 ) -> Option<Arc<Staging>> {
     // SAFETY: a live resource.
-    let d = unsafe { texture.GetDesc() };
+    let mut d = unsafe { texture.GetDesc() };
     let widened_from = (d.Format.0 as u32 == crate::resource::RGBA8_UNORM
         && crate::resource::PACKED_16.contains(&title_format))
     .then_some(title_format);
+    // Use the title's concrete format when the host texture is typeless so
+    // `CopyTextureRegion` footprints never carry a `TYPELESS` format.
+    if widened_from.is_none()
+        && let Some(concrete) = crate::resource::view_format(resource)
+    {
+        d.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(concrete as i32);
+    }
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
