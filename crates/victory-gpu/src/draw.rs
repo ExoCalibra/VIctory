@@ -2288,12 +2288,31 @@ impl State {
                             host.constant_at(index, 0, 0);
                             continue;
                         }
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.constant_at(index, 0, 0);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
+                        // Mirror `root_view`: when the constant buffer lives in
+                        // an existing shadow copy at a 256-byte-aligned host GPU
+                        // address and fits within D3D12's 64 KiB CBV limit, bind
+                        // the shadow directly instead of allocating upload
+                        // scratch and emitting a `Step::Fill` that stalls on
+                        // in-flight shader writes.
+                        let aligned_size = size.next_multiple_of(256);
+                        if aligned_size > 0
+                            && aligned_size <= 65536
+                            && let Some(shadow) =
+                                crate::shadow::find(address, u64::from(aligned_size))
+                            && shadow.gpu(address) % 256 == 0
+                            && shadow.left(address) >= u64::from(aligned_size)
+                        {
+                            shadow.refresh(list, address, u64::from(aligned_size));
+                            list.buffer_read(&shadow.buffer);
+                            host.constant_at(index, shadow.gpu(address), size);
+                        } else {
+                            let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                                host.constant_at(index, 0, 0);
+                                continue;
+                            };
+                            list.defer_fill(to, address as *const u8, size as usize);
+                            host.constant_at(index, gpu, size);
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
