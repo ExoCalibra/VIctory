@@ -620,8 +620,15 @@ impl State {
             );
             return false;
         }
-        if !p.supports_input_topology(D3D_PRIMITIVE_TOPOLOGY(self.topology as i32)) {
-            once!(topology = self.topology, "a triangle geometry stage with another input topology");
+        // Direct rectangle draws expand to a triangle list before execution.
+        // The indexed and indirect paths already decline rectangles.
+        if self.topology != RECTANGLES
+            && !p.supports_input_topology(D3D_PRIMITIVE_TOPOLOGY(self.topology as i32))
+        {
+            once!(
+                topology = self.topology,
+                "a triangle geometry stage with another input topology"
+            );
             return false;
         }
         if !self.bind(list, p, false) {
