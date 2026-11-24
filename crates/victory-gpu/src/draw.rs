@@ -1613,6 +1613,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
+        use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];
         };
@@ -1623,7 +1624,16 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let mut what = describe(crate::descriptor::view(handle).as_ref());
+                        // What an empty slot here gets: a null of the kind the
+                        // shaders annotate, or the plain null 2D view.
+                        match table_view_props(p, u.slot, u.table_offset_dwords) {
+                            Some((kind, more)) => {
+                                let _ = write!(what, " [annotated {kind:#x} {more:#x}]");
+                            }
+                            None => what.push_str(" [not annotated]"),
+                        }
+                        what
                     }
                     (root, _) => format!("{root:?}"),
                 };
