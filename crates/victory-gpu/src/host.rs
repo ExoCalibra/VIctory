@@ -1973,6 +1973,10 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        // The copies below see title memory as at this submission: each
+        // page's written state is asked of the kernel once for all of them
+        // (again after a step that writes title memory).
+        let sweep = crate::watch::Sweep::begin();
         for list in runs {
             let uploads = list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -1982,6 +1986,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.prepare_bindless();
+        drop(sweep);
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -3343,6 +3348,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        crate::watch::Sweep::title_written();
     }
 
     fn flush(&mut self) {
