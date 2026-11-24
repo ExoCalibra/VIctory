@@ -6081,7 +6081,6 @@ impl<'a> Lower<'a> {
                 Err("ldexp requires the console floating-point rounding and denormal mode")
             }
             "v_mullit_f32" => Err("lighting multiply needs the console NaN, infinity and overflow rules"),
-            "v_dot2_f32_f16" | "v_dot2c_f32_f16" => Err("half dot product rounding is unspecified by the emitter"),
             "v_fmamk_f16" | "v_fmaak_f16" => Err("half FMA requires a single rounding to f16"),
             n if n.starts_with("v_cvt_norm_") || n.starts_with("v_cvt_pknorm_") => {
                 Err("normalized conversion needs the console rounding and NaN rules")
@@ -6530,6 +6529,75 @@ impl<'a> Lower<'a> {
                     }
                     _ => self.fma_legacy(a, bb, acc),
                 };
+                float(self, r)
+            }
+            "v_dot2_f32_f16" | "v_dot2c_f32_f16" => {
+                // D.f32 = S0.f16[0] * S1.f16[0] + S0.f16[1] * S1.f16[1] + S2.f32;
+                // v_dot2c (VOP2) accumulates into its destination instead of
+                // S2. Each f16 and each of their products is exact in f32.
+                // shortcut: the two products and the addend are summed with
+                // two f32 roundings, where the hardware may round once.
+                let packed = name == "v_dot2_f32_f16";
+                if v.omod != 0
+                    || v.sdwa.is_some()
+                    || packed && v.neg_hi >> 2 & 1 != 0
+                    || !packed && (v.neg != 0 || v.abs != 0 || v.opsel != 0)
+                {
+                    return Err("modifiers on a 2-component f16 dot product");
+                }
+                let f32t = self.s.t.f32;
+                let mut products = Vec::with_capacity(2);
+                for high in [false, true] {
+                    let mut xy = Vec::with_capacity(2);
+                    for k in 0..2 {
+                        // VOP3P picks each half with op_sel/op_sel_hi; VOP2
+                        // takes the low half for the low product.
+                        let h = if packed {
+                            self.packed_src(inst, k, high)?
+                        } else {
+                            let x = s(self, k)?;
+                            let x = if high {
+                                let k16 = self.s.m.i32(16);
+                                self.s.m.bin(c, Bin::LShr, x, k16)
+                            } else {
+                                x
+                            };
+                            let m = self.s.m.i32(0xFFFF);
+                            self.s.m.bin(c, Bin::And, x, m)
+                        };
+                        let mut x = self
+                            .s
+                            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                        let neg = if high { v.neg_hi } else { v.neg };
+                        if packed && neg >> k & 1 != 0 {
+                            let z = self.s.m.f32(0x8000_0000);
+                            x = self.s.m.bin(c, Bin::Sub, z, x);
+                        }
+                        xy.push(x);
+                    }
+                    products.push(self.s.m.bin(c, Bin::Mul, xy[0], xy[1]));
+                }
+                let acc = if packed {
+                    // An f32 source: neg_lo bit 2 negates it.
+                    f(self, 2)?
+                } else {
+                    let Some(Operand::Vector { reg, .. }) = v.dst else {
+                        return Err("an accumulator");
+                    };
+                    let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
+                    match self.floats.get(&acc) {
+                        Some(&x) => x,
+                        None => {
+                            let x = self.i32_of(acc)?;
+                            self.as_float(x)
+                        }
+                    }
+                };
+                let sum = self.s.m.bin(c, Bin::Add, products[0], products[1]);
+                let mut r = self.s.m.bin(c, Bin::Add, sum, acc);
+                if v.clamp {
+                    r = self.unary(7, r);
+                }
                 float(self, r)
             }
             "v_fma_legacy_f32" => {
