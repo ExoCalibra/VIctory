@@ -5,6 +5,10 @@
 //! user data, root views for the title's root views and for addresses the
 //! title passes in root constants, static samplers for the immediate
 //! samplers, and directly indexed heaps.
+//!
+//! A pipeline with a geometry stage runs the ES half of its vertex
+//! container as the vertex shader and the GS half of its geometry
+//! container, each with its own bindings as the other stages have.
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
@@ -17,7 +21,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
-use super::{Shader, Translated};
+use super::{Program, Shader, Translated};
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -445,6 +449,8 @@ const QUADS: i32 = 32;
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    /// Which of its container's programs runs.
+    pub(crate) program: Program,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -460,7 +466,7 @@ pub(crate) struct Stage {
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
         self.shader
-            .translated()
+            .translated_as(self.program)
             .expect("host pipelines are made from translated shaders")
     }
 }
@@ -472,7 +478,8 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
-    /// Vertex, then pixel stage, or the compute stage.
+    /// Vertex (or mesh), geometry if any, then pixel stage; or the compute
+    /// stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
@@ -499,8 +506,8 @@ impl HostPipeline {
         self.stages.iter().any(|s| !s.root_uavs.is_empty())
     }
 
-    /// A host pipeline for vertex and pixel shaders with the graphics
-    /// state `g`, or for one compute shader.
+    /// A host pipeline for vertex (or mesh), optionally geometry, and pixel
+    /// shaders with the graphics state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
@@ -510,24 +517,34 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh" | "geometry"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, mesh, geometry, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        let geometry = find("geometry");
         let stages = if let Some(cs) = compute {
-            vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
+            vec![(cs, D3D12_SHADER_VISIBILITY_ALL, Program::Main)]
         } else {
-            let first = match (mesh, find("vertex")) {
-                (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
-                (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
-                (None, None) => return refuse("no vertex or mesh shader", shaders),
+            let first = match (mesh, find("vertex"), geometry) {
+                (Some(_), _, Some(_)) => {
+                    return refuse("a mesh pipeline with a geometry stage", shaders);
+                }
+                (Some(ms), _, None) => (ms, D3D12_SHADER_VISIBILITY_MESH, Program::Main),
+                (None, Some(vs), gs) => (
+                    vs,
+                    D3D12_SHADER_VISIBILITY_VERTEX,
+                    Program::of(vs.stage, gs.is_some()),
+                ),
+                (None, None, _) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY, Program::Gs)));
+            stages
+                .extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL, Program::Main)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -536,8 +553,8 @@ impl HostPipeline {
                 shaders,
             );
         }
-        for (s, _) in &stages {
-            s.translated()?;
+        for &(s, _, program) in &stages {
+            s.translated_as(program)?;
         }
         let host = host()?;
 
@@ -551,8 +568,8 @@ impl HostPipeline {
             D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
         };
         let mut root_views: Vec<((i32, u8), u32)> = Vec::new();
-        for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+        for &(shader, visibility, program) in &stages {
+            let t = &shader.translated_as(program)?.host;
             let (resource_heap, sampler_heap) = t.directly_indexed_heaps();
             if resource_heap {
                 flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
@@ -562,6 +579,7 @@ impl HostPipeline {
             }
             let mut stage = Stage {
                 shader: shader.clone(),
+                program,
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
@@ -648,23 +666,31 @@ impl HostPipeline {
                 return None;
             }
         };
-        let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+        // The bytecode of the stage with this visibility (none if absent).
+        let code = |visibility: D3D12_SHADER_VISIBILITY| {
+            let stage = stages.iter().find(|s| s.1 == visibility);
+            stage
+                .and_then(|&(s, _, program)| s.translated_as(program))
+                .map_or(D3D12_SHADER_BYTECODE::default(), |t| {
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: t.host.dxil.as_ptr().cast(),
+                        BytecodeLength: t.host.dxil.len(),
+                    }
+                })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-                CS: code(0),
+                CS: code(D3D12_SHADER_VISIBILITY_ALL),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name(
+                "compute",
+                &root_blob,
+                &[&code_bytes(&code(D3D12_SHADER_VISIBILITY_ALL))],
+                "",
+            );
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -717,6 +743,14 @@ impl HostPipeline {
         } else {
             None
         };
+        let (vs, ps) = (
+            code(if mesh.is_some() {
+                D3D12_SHADER_VISIBILITY_MESH
+            } else {
+                D3D12_SHADER_VISIBILITY_VERTEX
+            }),
+            code(D3D12_SHADER_VISIBILITY_PIXEL),
+        );
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `stream_pipeline`); a
@@ -725,14 +759,15 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&vs), &code_bytes(&ps)],
                 &state,
             );
             let pso = match stream_pipeline(
                 &host.device,
                 &root,
-                code(0),
-                code(1),
+                vs,
+                None,
+                ps,
                 false,
                 g,
                 depth1,
@@ -761,11 +796,13 @@ impl HostPipeline {
             });
         }
 
+        let gs = code(D3D12_SHADER_VISIBILITY_GEOMETRY);
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-            VS: code(0),
-            PS: code(1),
+            VS: vs,
+            PS: ps,
+            GS: gs,
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -775,26 +812,45 @@ impl HostPipeline {
                 NumElements: g.inputs.len() as u32,
             },
             IBStripCutValue: g.strip_cut,
-            PrimitiveTopologyType: g.host_topology(),
+            // shortcut: a geometry stage is always given triangles (the
+            // translated GS declares triangle input); a title drawing
+            // another primitive through one would need the GS translated
+            // for that primitive.
+            PrimitiveTopologyType: if geometry.is_some() {
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+            } else {
+                g.host_topology()
+            },
             NumRenderTargets: g.targets.NumRenderTargets,
             RTVFormats: g.targets.RTFormats,
             DSVFormat: g.depth_format,
             SampleDesc: g.samples,
             ..Default::default()
         };
-        let name = super::library::name(
-            "graphics",
-            &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-            &state,
-        );
+        // Pipelines without a geometry stage keep the names they had.
+        let name = if geometry.is_some() {
+            super::library::name(
+                "geometry",
+                &root_blob,
+                &[&code_bytes(&vs), &code_bytes(&gs), &code_bytes(&ps)],
+                &state,
+            )
+        } else {
+            super::library::name(
+                "graphics",
+                &root_blob,
+                &[&code_bytes(&vs), &code_bytes(&ps)],
+                &state,
+            )
+        };
         let made = if depth2.is_some() || depth1.is_some() {
             // Separate front/back stencil masks or depth bounds need the stream form.
             stream_pipeline(
                 &host.device,
                 &root,
-                code(0),
-                code(1),
+                vs,
+                geometry.is_some().then_some(gs),
+                ps,
                 true,
                 g,
                 depth1,
@@ -875,6 +931,7 @@ fn stream_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
     first: D3D12_SHADER_BYTECODE,
+    gs: Option<D3D12_SHADER_BYTECODE>,
     ps: D3D12_SHADER_BYTECODE,
     vertex: bool,
     g: &GraphicsState,
@@ -890,6 +947,9 @@ fn stream_pipeline(
     );
     if vertex {
         stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, first);
+        if let Some(gs) = gs {
+            stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, gs);
+        }
         stream.push(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
             D3D12_INPUT_LAYOUT_DESC {
@@ -903,7 +963,11 @@ fn stream_pipeline(
         );
         stream.push(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
-            g.host_topology(),
+            if gs.is_some() {
+                D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+            } else {
+                g.host_topology()
+            },
         );
     } else {
         stream.push(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, first);

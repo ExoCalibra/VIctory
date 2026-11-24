@@ -78,22 +78,39 @@ fn build() -> &'static [u8; 32] {
 }
 
 /// The translation of a console shader container for a host that runs
-/// `target`'s wave sizes, from the cache when there is one.
-pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
-    let translate =
-        |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
+/// `target`'s wave sizes, from the cache when there is one: the program
+/// [`victory_shader::emit::translate_for`] picks, or with `stage` the program
+/// of that hardware stage (the ES or GS half of a geometry pipeline).
+pub(crate) fn host_shader(
+    container: &[u8],
+    stage: Option<HwStage>,
+    target: Target,
+) -> Result<HostShader, String> {
+    let translate = |c: &[u8]| {
+        match stage {
+            Some(stage) => victory_shader::emit::translate_stage_for(c, stage, target),
+            None => victory_shader::emit::translate_for(c, target),
+        }
+        .map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, &key(build(), target), container, translate),
+        Some(cache) => cached(cache, &key(build(), stage, target), container, translate),
         None => translate(container),
     }
 }
 
-/// The part of an entry's key before the container: the build, and the
-/// host's wave sizes (a translation for one host's waves is not another's).
-fn key(build: &[u8; 32], target: Target) -> [u8; 32] {
+/// The part of an entry's key before the container: the build, the host's
+/// wave sizes (a translation for one host's waves is not another's), and the
+/// optional hardware stage (so ES and VS translations of one container are
+/// separate entries).
+fn key(build: &[u8; 32], stage: Option<HwStage>, target: Target) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     h.update(&target.key());
+    if let Some(stage) = stage {
+        h.update(b"stage");
+        h.update(format!("{stage:?}").as_bytes());
+    }
     *h.finalize().as_bytes()
 }
 
