@@ -627,12 +627,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let end = end.max(address.saturating_add(64 << 10));
     let len = end.checked_next_multiple_of(WINDOW)? - start;
+    if !crate::texture::committed(address as *const u8, 1) {
+        return None;
+    }
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
-    }
-    if !crate::texture::committed(address as *const u8, 1) {
-        return None;
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));

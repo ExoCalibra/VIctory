@@ -4072,15 +4072,22 @@ pub(crate) mod tests {
             HwStage::Ms,
         ] {
             for user_data in [250, 255] {
-                let err = track(&p, &[param(Table, user_data, 1)], stage, None).unwrap_err();
-                assert_eq!(
-                    err,
-                    ShaderError::Unsupported {
-                        offset: 0,
-                        what: "an address in an SGPR that is no root parameter"
-                    },
-                    "{stage:?} at user data {user_data}"
-                );
+                let res = track(&p, &[param(Table, user_data, 1)], stage, None);
+                if stage == HwStage::Gs {
+                    // Merged GS leaves NOT_ROOT SMEM loads untraced (driver ring table),
+                    // whereas wrapping 250 + 8 onto s2 would fail on the untracked high half.
+                    let tracked = res.expect("GS skips NOT_ROOT SMEM loads");
+                    assert!(tracked.scalar.is_empty(), "GS at user data {user_data}");
+                } else {
+                    assert_eq!(
+                        res.unwrap_err(),
+                        ShaderError::Unsupported {
+                            offset: 0,
+                            what: "an address in an SGPR that is no root parameter"
+                        },
+                        "{stage:?} at user data {user_data}"
+                    );
+                }
             }
         }
         // Wrapped, 250 + 8 named s2 and the load was claimed for the table
