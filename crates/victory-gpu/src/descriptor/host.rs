@@ -858,6 +858,7 @@ impl HostHeap {
             _ => null_view(at),
         }
         self.keep(index, None);
+        self.forget_view(index);
     }
 
     /// Makes slot `index` a typed null descriptor matching a shader's
@@ -869,6 +870,7 @@ impl HostHeap {
             write_null(desc, self.cpu(index));
         }
         self.keep(index, None);
+        self.forget_view(index);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -1015,6 +1017,7 @@ impl HostHeap {
                         None => null_for(&view, self.cpu(index)),
                     }
                 }
+                self.note_view(index, &view, kept.as_ref());
                 self.keep(index, kept.flatten());
             }
         }
@@ -1088,6 +1091,7 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, None);
+        self.forget_view(index);
     }
 
     fn ensure_placed_slot(
@@ -1115,7 +1119,7 @@ impl HostHeap {
             } else {
                 made[index as usize] = want;
             }
-            self.note_view(index, &view, kept.as_ref());
+            self.note_view(index, shader_view, kept.as_ref());
             self.keep(index, kept.flatten());
         }
     }
@@ -1125,6 +1129,7 @@ impl HostHeap {
         let want = SlotState::View(key);
         if made[index as usize] != want {
             let kept = make(view, self.cpu(index));
+            self.note_view(index, view, kept.as_ref());
             let res = kept.flatten();
             if res.is_none() {
                 null_for(view, self.cpu(index));

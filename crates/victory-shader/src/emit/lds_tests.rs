@@ -187,6 +187,8 @@ fn build_cs(body: &[u32], threads: u32) -> HostShader {
         root_uavs: lowered.root_uavs,
         address_srvs: lowered.address_srvs,
         root_indexed_views: res.root_indexed_views,
+        table_views: Vec::new(),
+        stride_table: false,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

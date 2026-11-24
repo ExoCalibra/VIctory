@@ -1451,6 +1451,8 @@ fn build_custom_cs(threads: u32, use_lds: bool, loop_limit: u32, body: &[u32]) -
         root_uavs: lowered.root_uavs,
         address_srvs: lowered.address_srvs,
         root_indexed_views: res.root_indexed_views,
+        table_views: Vec::new(),
+        stride_table: false,
     };
     validate_dxil(&shader.dxil);
     shader
@@ -1553,6 +1555,8 @@ fn fullscreen_vs() -> HostShader {
         root_uavs: Vec::new(),
         address_srvs: Vec::new(),
         root_indexed_views: Vec::new(),
+        table_views: Vec::new(),
+        stride_table: false,
     }
 }
 
@@ -1665,6 +1669,8 @@ fn s_wqm_pixel_loop_and_skip_run_per_quad() {
         root_uavs: Vec::new(),
         address_srvs: Vec::new(),
         root_indexed_views: Vec::new(),
+        table_views: Vec::new(),
+        stride_table: false,
     };
     let vs = fullscreen_vs();
     let vertices = [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0];
@@ -2273,6 +2279,8 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_uavs: slots.to_vec(),
             address_srvs: Vec::new(),
             root_indexed_views: Vec::new(),
+            table_views: Vec::new(),
+            stride_table: false,
         }
     };
 
@@ -3424,6 +3432,7 @@ fn build_root_srv_cs(body: &[u32]) -> HostShader {
         root_indexed_views: Vec::new(),
         address_srvs: lowered.address_srvs,
         table_views: lowered.table_views,
+        stride_table: false,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

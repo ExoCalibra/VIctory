@@ -860,6 +860,8 @@ mod tests {
             root_uavs: Vec::new(),
             address_srvs: Vec::new(),
             root_indexed_views: Vec::new(),
+            table_views: Vec::new(),
+            stride_table: false,
         };
         assert_eq!(shader.directly_indexed_heaps(), (false, false));
         for (features, expected) in [
@@ -1439,6 +1441,7 @@ mod tests {
             root_indexed_views: vec![],
             address_srvs: vec![],
             table_views: vec![],
+            stride_table: false,
         };
 
         let mut gs_words = own_ring;
@@ -2522,6 +2525,8 @@ mod barycentric_tests {
                 root_uavs: l.root_uavs,
                 address_srvs: l.address_srvs,
                 root_indexed_views: res.root_indexed_views,
+                table_views: Vec::new(),
+                stride_table: false,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2784,11 +2789,12 @@ mod barycentric_tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         let mut l = super::lower::lower(&super::lower::Parts {
             native: &native,
+            psv: None,
             p: &p,
             st: &st,
             io: &io,
@@ -2797,6 +2803,9 @@ mod barycentric_tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
         assert!(l.stride_table);
@@ -2825,6 +2834,10 @@ mod barycentric_tests {
             static_samplers: Vec::new(),
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+            address_srvs: l.address_srvs,
+            table_views: l.table_views,
             stride_table: l.stride_table,
         }
     }
@@ -2962,13 +2975,19 @@ mod barycentric_tests {
                 };
                 table.extend(entry.words());
             }
+            let mut ud = vec![0u32; cs.user_data_dwords().max(5) as usize];
+            for u in &cs.user_data {
+                if u.root == crate::RootType::ResourceHeap {
+                    ud[u.index as usize] = views.len() as u32;
+                }
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
                         roots: vec![
-                            (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                            (0, Root::Constants(ud)),
                             (
                                 1,
                                 Root::View {
@@ -3086,13 +3105,19 @@ mod barycentric_tests {
                 // The slot each of the two groups reads, in the buffer in
                 // slot 0.
                 for (slots, want) in [([2, 3], [of_a, of_b]), ([3, 2], [of_b, of_a])] {
+                    let mut ud = vec![0u32; cs.user_data_dwords().max(5) as usize];
+                    for u in &cs.user_data {
+                        if u.root == crate::RootType::ResourceHeap {
+                            ud[u.index as usize] = 6;
+                        }
+                    }
                     let out = host
                         .dispatch(
                             &root,
                             &pso,
                             &Dispatch {
                                 roots: vec![
-                                    (0, Root::Constants(vec![0, 0, 0, 0, 0])),
+                                    (0, Root::Constants(ud)),
                                     (
                                         1,
                                         Root::View {
@@ -3179,13 +3204,20 @@ mod barycentric_tests {
                 let (root, pso) = host.compute_pipeline(&cs).unwrap();
                 // s0: 1 takes the first load, 0 the second.
                 for (s0, want) in [(1, 107), (0, 209)] {
+                    let mut ud = vec![0u32; cs.user_data_dwords().max(5) as usize];
+                    ud[0] = s0;
+                    for u in &cs.user_data {
+                        if u.root == crate::RootType::ResourceHeap {
+                            ud[u.index as usize] = 5;
+                        }
+                    }
                     let out = host
                         .dispatch(
                             &root,
                             &pso,
                             &Dispatch {
                                 roots: vec![
-                                    (0, Root::Constants(vec![s0, 0, 0, 0, 0])),
+                                    (0, Root::Constants(ud)),
                                     (
                                         1,
                                         Root::View {

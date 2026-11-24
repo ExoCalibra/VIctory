@@ -115,16 +115,18 @@ fn program() -> HostShader {
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = victory_shader::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-    let res = victory_shader::resource::track(&p, &native.layout, native.stage).unwrap();
-    let io = victory_shader::io::raise(&p, &native).unwrap();
     let st = victory_shader::structure::structure(&p).unwrap();
+    let res = victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = victory_shader::io::raise(&p, &native).unwrap();
     // An empty container (no signature parts): the tag, a digest, version
     // 1, its size, no parts.
     let mut container = b"DXBC".to_vec();
     container.extend([0; 16]);
     container.extend([1u32, 32, 0].into_iter().flat_map(u32::to_le_bytes));
     let c = victory_shader::Container::parse(&container).unwrap();
-    let cs = victory_shader::emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+    let cs =
+        victory_shader::emit::emit(&c, &native, &p, &st, &io, &res, victory_shader::emit::Target::ANY)
+            .unwrap();
     assert!(cs.stride_table);
     cs
 }
@@ -201,9 +203,15 @@ fn dispatch(
     heap: &HostHeap,
     root: &ID3D12RootSignature,
     pso: &ID3D12PipelineState,
-    user_data: u32,
+    cs: &HostShader,
 ) -> windows::core::Result<()> {
-    let zeros = vec![0u32; user_data as usize];
+    let user_data = cs.user_data_dwords();
+    let mut words = vec![0u32; user_data as usize];
+    for u in &cs.user_data {
+        if u.root == RootType::ResourceHeap {
+            words[u.index as usize] = heap.guard_slot();
+        }
+    }
     // SAFETY: an open list with every root argument set; the heap, its
     // table and the buffers its views read outlive the wait.
     unsafe {
@@ -217,7 +225,7 @@ fn dispatch(
             device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)?;
         list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
         list.SetComputeRootSignature(root);
-        list.SetComputeRoot32BitConstants(0, user_data, zeros.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, user_data, words.as_ptr().cast(), 0);
         list.SetComputeRootShaderResourceView(1, heap.stride_table_gpu().expect("a table"));
         list.Dispatch(2, 1, 1);
         list.Close()?;
@@ -288,12 +296,12 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
     // they write, elements of 4 bytes from element 5 (20 bytes in).
     let structured = |stride| (0, stride, 0);
     let raw = (R32_TYPELESS, 0, RAW);
-    heap.make_at(0, &placed(false, slots, raw, (0, 16)));
-    heap.make_at(1, &placed(true, written, structured(4), (5, 8)));
+    heap.make_at(0, &placed(false, slots, raw, (0, 16)), None);
+    heap.make_at(1, &placed(true, written, structured(4), (5, 8)), None);
     // Slot 2: three elements of 12 bytes from element 3 (36 bytes in).
     // Slot 3: four RGBA32F elements from element 2 (32 bytes in).
-    heap.make_at(2, &placed(false, data, structured(12), (3, 3)));
-    heap.make_at(3, &placed(false, data, (R32G32B32A32_FLOAT, 0, 0), (2, 4)));
+    heap.make_at(2, &placed(false, data, structured(12), (3, 3)), None);
+    heap.make_at(3, &placed(false, data, (R32G32B32A32_FLOAT, 0, 0), (2, 4)), None);
 
     // Raw views have their own slots; the others one each in the pool
     // after the heap's two null raw views, 4 bytes early where the view
@@ -320,7 +328,7 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
         unsafe {
             slots_copy.cast::<[u32; 2]>().write(chosen);
             out.add(5).cast::<[u32; 8]>().write([0; 8]);
-            dispatch(device, &heap, &root, &pso, cs.user_data_dwords()).expect("a dispatch");
+            dispatch(device, &heap, &root, &pso, &cs).expect("a dispatch");
             out.add(5).cast::<[u32; 8]>().read()
         }
     };
@@ -333,8 +341,8 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
     // The title rebinds the slots: slot 2 to four elements of 20 bytes from
     // element 1 (in the raw view slot it had), slot 3 to a raw view from
     // dword 8 (its own slot; its raw view slot goes back to the pool).
-    heap.make_at(2, &placed(false, data, structured(20), (1, 4)));
-    heap.make_at(3, &placed(false, data, raw, (8, 64)));
+    heap.make_at(2, &placed(false, data, structured(20), (1, 4)), None);
+    heap.make_at(3, &placed(false, data, raw, (8, 64)), None);
     assert_eq!(heap.entry_words(2), entry(20, Some(pool + 1), 4));
     assert_eq!(heap.entry_words(3), entry(4, None, 0));
     let (twenty, plain) = ([106, 111, 116, 121], [109, 110, 111, 112]);
@@ -345,18 +353,18 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
     heap.make_null(2);
     assert_eq!(heap.entry_words(2), [0, 0]);
     assert_eq!(run([2, 3]), [[0; 4], plain].concat()[..]);
-    heap.make_at(4, &placed(false, data, structured(16), (1, 2)));
+    heap.make_at(4, &placed(false, data, structured(16), (1, 2)), None);
     assert_eq!(heap.entry_words(4), entry(16, Some(pool + 1), 0));
-    heap.make_at(5, &placed(false, data, structured(8), (2, 2)));
+    heap.make_at(5, &placed(false, data, structured(8), (2, 2)), None);
     assert_eq!(heap.entry_words(5), entry(8, Some(pool + 2), 0));
 
     // Dynamic slots give their raw views back when their list is done.
     let first = heap.dynamic(2).expect("dynamic slots");
-    heap.make_at(first, &placed(false, data, structured(12), (0, 4)));
+    heap.make_at(first, &placed(false, data, structured(12), (0, 4)), None);
     assert_eq!(heap.entry_words(first), entry(12, Some(pool + 3), 0));
     heap.release(first, 2);
     assert_eq!(heap.entry_words(first), [0, 0]);
-    heap.make_at(6, &placed(false, data, structured(12), (0, 4)));
+    heap.make_at(6, &placed(false, data, structured(12), (0, 4)), None);
     assert_eq!(heap.entry_words(6), entry(12, Some(pool + 3), 0));
     drop(memory);
 }
