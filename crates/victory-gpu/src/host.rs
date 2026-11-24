@@ -303,6 +303,7 @@ impl Host {
     #[cfg(test)]
     pub(crate) fn new_warp() -> Option<Host> {
         let adapter = warp_adapter().ok()?;
+        // SAFETY: `adapter` is a live DXGI adapter returned by `warp_adapter`.
         let desc = unsafe { adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()? };
         let mut device: Option<ID3D12Device> = None;
         // SAFETY: `adapter` is a verified software WARP adapter.
@@ -310,6 +311,7 @@ impl Host {
         let device = device?;
         let caps = probe_caps(&device, &desc);
         let mut options2 = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+        // SAFETY: `options2` matches `D3D12_FEATURE_D3D12_OPTIONS2` and its byte size.
         let depth_bounds_supported = unsafe {
             device.CheckFeatureSupport(
                 D3D12_FEATURE_D3D12_OPTIONS2,
@@ -1002,6 +1004,7 @@ mod tests {
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
         let Ok(raw) = raw else { return };
+        // SAFETY: `raw` is a live DXGI adapter returned by `EnumWarpAdapter`.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
         eprintln!(
             "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
@@ -3304,7 +3307,7 @@ impl Batch {
     /// the write-watch's answer); their unordered access ranges are kept
     /// for copy-back only when a shader that may write memory uses the heap.
     fn prepare_bindless(&mut self) {
-        self.flush();
+        let mut pending_writes = Vec::new();
         for (heap, writes) in std::mem::take(&mut self.bindless) {
             let started = std::time::Instant::now();
             let plan = heap.bindless_plan();
@@ -3320,17 +3323,23 @@ impl Batch {
                     add(C::Refreshes, 1);
                     add(C::RefreshBytes, *len as u64);
                 }
-                update(shadow, *address, *len);
+                self.add(shadow, *address, *len);
             }
             if writes {
-                for (shadow, address, len) in &plan.writes {
-                    if self.new_gpu_write(shadow, *address, *len) {
-                        shadow.writing(*address, *len);
-                        self.gpu_writes.push((shadow.clone(), *address, *len));
-                    }
-                }
+                pending_writes.push(plan.clone());
             }
             self.plans.push(plan);
+        }
+        // Coalesce bindless read ranges with direct-draw refreshes before
+        // snapshotting bindless UAV write ranges.
+        self.flush();
+        for plan in pending_writes {
+            for (shadow, address, len) in &plan.writes {
+                if self.new_gpu_write(shadow, *address, *len) {
+                    shadow.writing(*address, *len);
+                    self.gpu_writes.push((shadow.clone(), *address, *len));
+                }
+            }
         }
     }
 }
@@ -3401,8 +3410,9 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
-        // SAFETY: the query inspects an address and fills a local structure.
+        // SAFETY: `info` is a plain-old-data Windows struct; `VirtualQuery` reads no guest memory.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is valid for `size_of_val(&info)` bytes; `VirtualQuery` accepts any address.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);

@@ -695,6 +695,7 @@ mod tests {
         depth.flags = ALLOW_DEPTH_STENCIL;
         let layout = |d: &ResourceDesc| {
             let c = create(d);
+            // SAFETY: `LayoutOut` is a plain-old-data C struct where all-zero bits are valid.
             let mut out: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
             let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
             assert_eq!(get(c, &mut *out), S_OK);

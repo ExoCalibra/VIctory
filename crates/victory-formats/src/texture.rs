@@ -910,7 +910,7 @@ mod tests {
         assert!(depth > color, "HTILE is larger than color metadata");
         assert_eq!(
             depth / METADATA_ALIGNMENT,
-            (t.size / 8 + METADATA_ALIGNMENT - 1) / METADATA_ALIGNMENT
+            (t.size / 8).div_ceil(METADATA_ALIGNMENT)
         );
         let one_d = texture_desc(&Desc {
             dimension: Dimension::Tex1d,

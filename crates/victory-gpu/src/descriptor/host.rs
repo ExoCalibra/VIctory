@@ -1085,7 +1085,7 @@ impl HostHeap {
         };
         let mut stale = Vec::new();
         let mut learnt = Vec::new();
-        let mut reached = Vec::new();
+        let mut reached: Vec<(Option<(u32, u64)>, crate::object::This)> = Vec::new();
         let left = self.budget_left(1);
         let mut todo = todo.into_iter();
         for (index, entry) in todo.by_ref() {
@@ -1104,8 +1104,7 @@ impl HostHeap {
             match self.resolve_placed(index, vi, generation) {
                 Ok(Some(t)) => {
                     let key = u64::from(generation) << 32 | u64::from(vi);
-                    learnt.push((index, (key, t as usize)));
-                    reached.push(t);
+                    reached.push((Some((index, key)), t));
                 }
                 Ok(None) => {}
                 Err(()) => stale.push(index),
@@ -1115,8 +1114,20 @@ impl HostHeap {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             b.record_pending.extend(todo.map(|(i, _)| i));
         }
-        reached.extend(due);
-        for texture in reached {
+        reached.extend(due.into_iter().map(|t| (None, t)));
+        let mut deferred_slots = Vec::new();
+        let mut deferred_recheck = Vec::new();
+        let mut reached_iter = reached.into_iter();
+        for (k, (slot, texture)) in reached_iter.by_ref().enumerate() {
+            // Check budget between texture uploads too: detiling and uploading
+            // many large placed textures can otherwise stall one draw for seconds.
+            if k > 0 && started.elapsed().as_micros() as u64 > left {
+                match slot {
+                    Some((index, _)) => deferred_slots.push(index),
+                    None => deferred_recheck.push((frame.saturating_sub(RECHECK_FRAMES), texture as usize)),
+                }
+                break;
+            }
             // The texture may be evicted meanwhile: it is used only while
             // it is known alive.
             crate::resource::with_placed(texture, || {
@@ -1131,10 +1142,27 @@ impl HostHeap {
                 const SHADER_RESOURCE: u32 = 0x40 | 0x80;
                 crate::list::ensure_state(list, texture, SHADER_RESOURCE);
             });
+            if let Some((index, key)) = slot {
+                learnt.push((index, (key, texture as usize)));
+            }
         }
-        if !stale.is_empty() || !learnt.is_empty() {
+        for (slot, texture) in reached_iter {
+            match slot {
+                Some((index, _)) => deferred_slots.push(index),
+                None => deferred_recheck.push((frame.saturating_sub(RECHECK_FRAMES), texture as usize)),
+            }
+        }
+        if !stale.is_empty()
+            || !learnt.is_empty()
+            || !deferred_slots.is_empty()
+            || !deferred_recheck.is_empty()
+        {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             b.recorded.extend(learnt);
+            b.record_pending.extend(deferred_slots);
+            for item in deferred_recheck {
+                b.recheck.push_front(item);
+            }
             for idx in stale {
                 self.drop_bindless(&mut b, idx, None);
             }

@@ -743,9 +743,9 @@ pub(crate) fn expand(
     ) else {
         return Err("rectangle clamp unavailable");
     };
-    // SAFETY: live D3D12 resources (`clamped` is in `UNORDERED_ACCESS`).
-    let src_args_gpu = unsafe { clamped.GetGPUVirtualAddress() };
-    let dst_args_gpu = unsafe { dst_args_buf.GetGPUVirtualAddress() };
+    // SAFETY: live D3D12 buffer resources (`clamped` and `dst_args_buf`).
+    let (src_args_gpu, dst_args_gpu) =
+        unsafe { (clamped.GetGPUVirtualAddress(), dst_args_buf.GetGPUVirtualAddress()) };
     if let Some((c, _)) = counter {
         list.buffer_state(&c.buffer, crate::host::BUFFER_WRITE);
     }
