@@ -170,6 +170,9 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
+    /// First resource use `(use_site, first_dword)` per descriptor load site,
+    /// precomputed once so `descriptor_data` resolves in O(1).
+    descriptor_uses: HashMap<Site, (Site, u8)>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
@@ -475,6 +478,17 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
+            descriptor_uses: {
+                let mut uses = HashMap::new();
+                for d in x.res.descriptors.iter().filter(|d| d.role == Role::Resource) {
+                    for leaf in d.source.leaves() {
+                        if let Source::Loaded { load, first } = *leaf {
+                            uses.entry(load).or_insert((d.site, first));
+                        }
+                    }
+                }
+                uses
+            },
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
@@ -2944,19 +2958,7 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         // How the program uses the descriptor tells the view's kind.
-        let use_at = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
-                })
-            });
-        let Some((at, first)) = use_at else {
+        let Some((at, first)) = self.descriptor_uses.get(&site).copied() else {
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
