@@ -9838,13 +9838,12 @@ impl<'a> Lower<'a> {
         }
         let guard = self.guard(b, i)?;
         let mesh = self.s.mesh.is_some();
+        let pixel_done = self.s.pixel && e.done;
         let c = self.cur;
         if let Some(g) = guard
             && !mesh
+            && pixel_done
         {
-            if !(e.done && self.s.pixel) {
-                return Err("a conditional export");
-            }
             let t = self.s.m.bool(true);
             let kill = self.s.m.bin(c, Bin::Xor, g, t);
             self.s
@@ -9980,6 +9979,8 @@ impl<'a> Lower<'a> {
         // A mesh lane writes its own vertex or primitive, where it exports.
         // Guard against lane indices >= max_vertices / max_primitives so
         // lowered limits (#459) or wide groups cannot write OOB (#458).
+        // Other conditional exports also run only for their enabled lanes;
+        // a pixel's final `done` export instead discards the other lanes.
         let at = if mesh {
             let flat = self.mesh_thread();
             let limit = self.s.mesh.map_or(0, |m| {
@@ -10001,6 +10002,8 @@ impl<'a> Lower<'a> {
                 guard
             };
             self.begin_guarded(mesh_guard)
+        } else if !pixel_done {
+            self.begin_guarded(guard)
         } else {
             None
         };
