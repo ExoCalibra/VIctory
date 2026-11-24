@@ -834,7 +834,10 @@ mod tests {
         assert_eq!(peek(b + 6), 3, "the title's byte from before");
         // What the shader wrote does go back, in either kind of range.
         assert_eq!((peek(a + 7), peek(b + 9)), (9, 7));
-        assert!(s.before.lock().unwrap().is_none(), "the snapshot is done");
+        assert!(
+            s.before.lock().unwrap().snapshot.is_none(),
+            "the snapshot is done"
+        );
     }
 
     /// Two declared ranges that overlap: the first one's copy-back gives

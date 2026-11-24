@@ -59,11 +59,6 @@ struct Last {
     asked: u64,
 }
 
-/// Room to read a watched texture's memory into, shared by all textures (a
-/// buffer each would hold the sum of their sizes for good). Kept, already
-/// touched, so refreshing does not fault its pages in again.
-static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
-
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
 unsafe impl Send for Staging {}
@@ -73,8 +68,8 @@ unsafe impl Sync for Staging {}
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
 thread_local! {
-    /// Texture memory read for hashing and detiling: one per submitting
-    /// thread, as large as the largest texture it read.
+    /// Texture memory read for hashing and detiling (both watched and unwatched
+    /// paths): one per submitting thread, as large as the largest texture it read.
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -165,10 +160,11 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            let mut read = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
-            read.resize(size, 0);
-            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&read);
+            SCRATCH.with_borrow_mut(|read| {
+                read.resize(size, 0);
+                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                self.detile(read);
+            });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return (size, true);
@@ -194,8 +190,8 @@ impl Staging {
     }
 
     /// After reading the texture's memory into `tiled`: detiles it unless
-    /// its hash is the last one's. Returns the bytes read.
-    fn changed(&self, last: &mut Last, tiled: &[u8]) -> usize {
+    /// its hash is the last one's. Returns `(bytes_read, dirty)`.
+    fn changed(&self, last: &mut Last, tiled: &[u8]) -> (usize, bool) {
         let size = tiled.len();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -364,7 +360,8 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         return None;
     }
     let host = host()?;
-    let s = create_staging(host, resource, texture, layout, memory)?;
+    let title_format = crate::resource::pc_format(desc.format);
+    let s = create_staging(host, resource, texture, title_format, layout, memory)?;
     tracing::debug!(?desc, "texture contents queued for staging upload");
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -374,12 +371,12 @@ fn create_staging(
     host: &crate::host::Host,
     resource: This,
     texture: &ID3D12Resource,
+    title_format: u32,
     layout: victory_formats::texture::Layout,
     memory: *const u8,
 ) -> Option<Arc<Staging>> {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    let title_format = crate::resource::pc_format(desc.format);
     let widened_from = (d.Format.0 as u32 == crate::resource::RGBA8_UNORM
         && crate::resource::PACKED_16.contains(&title_format))
     .then_some(title_format);
@@ -485,6 +482,7 @@ mod tests {
         let copy = Arc::new(HostTexture {
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+            twin: None,
         });
         (copy, layout_tex)
     }
@@ -634,6 +632,7 @@ mod tests {
             &host,
             std::ptr::null(),
             &copy.texture,
+            28,
             layout.clone(),
             title_mem.as_ptr(),
         )
@@ -733,7 +732,7 @@ mod tests {
             fill_linear_rgba(&layout, mem, v1);
         }
 
-        let staging = create_staging(&host, std::ptr::null(), &copy.texture, layout.clone(), raw)
+        let staging = create_staging(&host, std::ptr::null(), &copy.texture, 28, layout.clone(), raw)
             .expect("create staging");
 
         let run_once = || {
@@ -797,7 +796,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod widened_tests {
     use super::*;
     use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
 
