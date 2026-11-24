@@ -1987,6 +1987,71 @@ impl Host {
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let synthesized = if desc.is_none()
+            && let Some(res) = resource
+        {
+            // SAFETY: a live host resource.
+            let d = unsafe { res.GetDesc() };
+            let concrete = match d.Format {
+                DXGI_FORMAT_R8G8B8A8_TYPELESS => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
+                DXGI_FORMAT_B8G8R8A8_TYPELESS => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+                DXGI_FORMAT_B8G8R8X8_TYPELESS => Some(DXGI_FORMAT_B8G8R8X8_UNORM),
+                _ => None,
+            };
+            concrete.map(|format| {
+                let mut rtv = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: format,
+                    ..Default::default()
+                };
+                match d.Dimension {
+                    D3D12_RESOURCE_DIMENSION_TEXTURE1D if d.DepthOrArraySize > 1 => {
+                        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1DARRAY;
+                        rtv.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_RTV {
+                            MipSlice: 0,
+                            FirstArraySlice: 0,
+                            ArraySize: u32::from(d.DepthOrArraySize),
+                        };
+                    }
+                    D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+                        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE1D;
+                    }
+                    D3D12_RESOURCE_DIMENSION_TEXTURE3D => {
+                        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+                        rtv.Anonymous.Texture3D = D3D12_TEX3D_RTV {
+                            MipSlice: 0,
+                            FirstWSlice: 0,
+                            WSize: u32::from(d.DepthOrArraySize),
+                        };
+                    }
+                    _ if d.SampleDesc.Count > 1 && d.DepthOrArraySize > 1 => {
+                        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                        rtv.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_RTV {
+                            FirstArraySlice: 0,
+                            ArraySize: u32::from(d.DepthOrArraySize),
+                        };
+                    }
+                    _ if d.SampleDesc.Count > 1 => {
+                        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+                    }
+                    _ if d.DepthOrArraySize > 1 => {
+                        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                        rtv.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_RTV {
+                            MipSlice: 0,
+                            FirstArraySlice: 0,
+                            ArraySize: u32::from(d.DepthOrArraySize),
+                            PlaneSlice: 0,
+                        };
+                    }
+                    _ => {
+                        rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                    }
+                }
+                rtv
+            })
+        } else {
+            None
+        };
+        let desc = desc.or(synthesized.as_ref());
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource or a typed null view.
         unsafe {
@@ -2477,6 +2542,7 @@ impl HostList {
     /// shortcut: only writes declared through [`Self::defer_gpu_write`] are
     /// seen; a buffer-state tracker should replace this.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn gpu_written(&self, buffer: &ID3D12Resource) -> bool {
         use windows::core::Interface;
         self.deferred().copies.iter().any(|step| {

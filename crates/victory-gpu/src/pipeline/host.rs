@@ -12,7 +12,7 @@ use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::core::{Interface, PCSTR};
+use windows::core::PCSTR;
 
 use super::{Shader, Translated};
 use crate::host::host;
@@ -164,6 +164,7 @@ impl GraphicsState {
             sample_mask: desc.SampleMask,
             rasterizer: desc.RasterizerState,
             depth: desc.DepthStencilState,
+            depth_bounds: false,
             depth2: None,
             inputs,
             names,

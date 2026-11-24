@@ -621,7 +621,13 @@ pub(crate) fn test_compute_pipeline(
 ) -> This {
     let hash = blake3::hash(&host.dxil).to_hex()[..16].to_owned();
     let translated = OnceLock::new();
-    let _ = translated.set(Some(Translated { host, used }));
+    let resource_heap = host.directly_indexed_heaps().0;
+    let _ = translated.set(Some(Translated {
+        host,
+        used,
+        resource_heap,
+        writes_memory: true,
+    }));
     let shader = Arc::new(Shader {
         stage: "compute",
         hash,

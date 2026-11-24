@@ -1769,9 +1769,16 @@ mod rtv_slot_tests {
         crate::descriptor::create_rtv(null, null, &null_desc, handles[0]);
         crate::descriptor::create_rtv(null, target, null.cast(), handles[1]);
         crate::list::ensure_state(&list, target, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        let clear_rtv = crate::descriptor::rtv_record(handles[1])
+            .expect("rtv record")
+            .desc();
         // SAFETY: open list, live target and graphics pipeline.
         unsafe {
-            l.ClearRenderTargetView(host.rtv(Some(color), None), &[0.0, 0.0, 1.0, 1.0], None);
+            l.ClearRenderTargetView(
+                host.rtv(Some(color), clear_rtv.as_ref()),
+                &[0.0, 0.0, 1.0, 1.0],
+                None,
+            );
             l.SetGraphicsRootSignature(&root);
             l.SetPipelineState(&pso);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);

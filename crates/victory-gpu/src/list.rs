@@ -606,6 +606,18 @@ extern "system" fn copy_texture_region(
             let Some(from_tex) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            // SAFETY: a live host texture.
+            let src_host_fmt = unsafe { from_tex.GetDesc() }.Format.0 as u32;
+            let dst_pc_fmt = crate::resource::pc_format(dst.footprint.format);
+            if src_host_fmt == crate::resource::RGBA8_UNORM
+                && crate::resource::PACKED_16.contains(&dst_pc_fmt)
+            {
+                tracing::warn!(
+                    format = dst_pc_fmt,
+                    "skipping widened packed 16-bit texture-to-buffer readback"
+                );
+                return;
+            }
             let Some(bytes) = dst.footprint.bytes() else {
                 return;
             };

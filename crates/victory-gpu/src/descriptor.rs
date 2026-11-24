@@ -991,9 +991,12 @@ mod tests {
             // the later index. Inspect it without dispatching an invalid read.
             assert!(!host.retains_resource(static_only[0].1 / 32 + 2));
         }
+        let resource_heap = shader.directly_indexed_heaps().0;
         let pipeline = compute_for_test(Translated {
             host: shader,
             used: native.used,
+            resource_heap,
+            writes_memory: true,
         });
         let translated = pipeline.stages[0].translated();
         let mut readback = Vec::new();

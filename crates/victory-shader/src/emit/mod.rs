@@ -448,6 +448,8 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
         };
         assert_eq!(shader.directly_indexed_heaps(), (false, false));
         for (features, expected) in [

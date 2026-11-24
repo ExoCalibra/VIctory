@@ -1201,8 +1201,10 @@ fn host_texture(
     }
     // Make sRGB-castable textures typeless on the host so both linear UNORM
     // and `_SRGB` SRV/RTV views (as well as linear UAVs) remain D3D12-valid
-    // without losing sRGB hardware conversion.
-    if srgb_castable(d.format) {
+    // without losing sRGB hardware conversion. Widened packed-16 targets
+    // (B5G5R5A1/B4G4R4A4 -> RGBA8_UNORM) have no sRGB variant and must stay
+    // concrete RGBA8_UNORM so upload expansion and copy guards match.
+    if srgb_castable(pc_format(desc.format)) {
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
