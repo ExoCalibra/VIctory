@@ -550,6 +550,9 @@ struct Lower<'a> {
     /// Retry a compute shader with numeric selects only when the normal
     /// translation needs one. Unused selects need no fixed wave size.
     numeric_selects: bool,
+    /// A console wave64 compute program run as two 32-lane host waves
+    /// (each lane's reads stay in its half; see `Lower::new`).
+    split: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -1040,33 +1043,42 @@ impl<'a> Lower<'a> {
         let wide_lds =
             insts().any(|i| ds_integer_atomic(i.name()).is_some_and(|(_, wide, _)| wide));
         let mut console_lanes = false;
+        let mut split = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            let mut live = p.blocks.iter().enumerate().flat_map(|(b, block)| {
-                let dead = &dead;
-                block
-                    .insts
-                    .iter()
-                    .enumerate()
-                    .filter(move |&(i, _)| !dead.contains(&(b, i)))
-                    .map(|(_, inst)| inst)
-            });
-            console_lanes = live.any(|i| {
+            let live = || {
+                p.blocks.iter().enumerate().flat_map(|(b, block)| {
+                    let dead = &dead;
+                    block
+                        .insts
+                        .iter()
+                        .enumerate()
+                        .filter(move |&(i, _)| !dead.contains(&(b, i)))
+                        .map(|(_, inst)| inst)
+                })
+            };
+            // Swizzles, DPP, permlane16 and quad derivatives stay within one 32-lane half.
+            let in_half = |i: &Inst| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
-                    || n.contains("permute")
                     || n.starts_with("v_permlane")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || implicit_derivatives(n)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+            };
+            let whole = |i: &Inst| {
+                let n = i.name();
+                n.contains("permute")
+                    || n.starts_with("v_mbcnt")
+                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || reads_mask_as_data(x.st, i)
                     || numeric_selects && numeric_select(x.st, i)
-            }) || {
+            };
+            let reads_whole = live().any(whole);
+            let masks_held = {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
                 let whens = x.st.exits.iter().filter_map(|e| match *e {
@@ -1131,9 +1143,26 @@ impl<'a> Lower<'a> {
                 }
                 needs_console
             };
+            console_lanes = reads_whole || masks_held || live().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            // On a host without 64-lane waves, a wave64 program whose lanes
+            // read only their own half runs as two 32-lane waves: what each
+            // lane reads is in its host wave, at its host lane's place in the
+            // row. Not with LDS (the console compiler may leave out barriers
+            // between the halves) nor whole-wave sections (their reductions
+            // become wave operations over the host's wave).
+            split = console_lanes
+                && x.native.wave64
+                && !reads_whole
+                && !masks_held
+                && s.lds_dwords == 0
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            if split {
+                s.wave_size = Some(32);
+            } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
         }
@@ -1287,6 +1316,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             numeric_selects,
+            split,
             flat: None,
             no_barrier,
             any_active_barrier: false,
@@ -1791,6 +1821,9 @@ impl<'a> Lower<'a> {
         };
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
+        }
+        if self.split {
+            return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
         let &m = self
@@ -2466,6 +2499,9 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if self.split {
+            return Err("a lane mask read whole in a wave64 program split in halves");
+        }
         if !self.x.st.active.contains(&lo) {
             return Err("a lane mask holding lanes elsewhere read as data");
         }
@@ -3130,8 +3166,10 @@ impl<'a> Lower<'a> {
         Ok(q)
     }
 
-    /// This lane's bit of the mask `lo`, `hi` (wave64).
+    /// This lane's bit of the mask `lo`, `hi` (wave64; host lane = console
+    /// lane, so not in a program split in halves).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
+        debug_assert!(!self.split);
         self.s.flags |= flags::WAVE_OPS;
         let lane = self.s.op(
             at,
