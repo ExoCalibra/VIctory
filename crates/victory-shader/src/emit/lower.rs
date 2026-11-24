@@ -4285,7 +4285,7 @@ impl<'a> Lower<'a> {
         // written misses the lanes it holds that do not run there: a loop's
         // exit mask gathers lanes that left in earlier iterations.
         if inst.write(Reg::S(EXEC)).is_some()
-            || self.is_mask(lo) && !(self.mask_ok && mask_set_op(name))
+            || self.is_mask(lo) && !(self.console_lanes && self.mask_ok && mask_set_op(name))
         {
             return Err(LANE_MASK);
         }
@@ -6332,6 +6332,15 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_swap_b32" => {
+                if v.abs != 0
+                    || v.neg != 0
+                    || v.clamp
+                    || v.omod != 0
+                    || v.sdwa.is_some()
+                    || v.dpp.is_some()
+                {
+                    return Err("modifiers on v_swap_b32");
+                }
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
                     Some(Operand::Vector { reg: dreg, .. }),
@@ -6339,8 +6348,14 @@ impl<'a> Lower<'a> {
                 else {
                     return Err("v_swap_b32");
                 };
-                let a = self.i32_of(inst.read(Reg::V(dreg)).ok_or("v_swap_b32")?)?;
-                let b = self.i32_of(inst.read(Reg::V(sreg)).ok_or("v_swap_b32")?)?;
+                let read_vgpr = |l: &mut Self, r: u8| -> Result<V, Why> {
+                    match inst.read(Reg::V(r)) {
+                        Some(o) => l.i32_of(o),
+                        None => Ok(l.s.m.i32(0)),
+                    }
+                };
+                let a = read_vgpr(self, dreg)?;
+                let b = read_vgpr(self, sreg)?;
                 self.write_placed(inst, Reg::V(dreg), b, guard);
                 if dreg != sreg {
                     self.write_placed(inst, Reg::V(sreg), a, guard);
@@ -6970,36 +6985,6 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             n if n.contains("_f64") => Err("floating-point arithmetic in f64 is not implemented by the DXIL emitter"),
-            "v_swap_b32" => {
-                if v.abs != 0
-                    || v.neg != 0
-                    || v.clamp
-                    || v.omod != 0
-                    || v.sdwa.is_some()
-                    || v.dpp.is_some()
-                {
-                    return Err("modifiers on v_swap_b32");
-                }
-                let Some(Operand::Vector { reg: dst, .. }) = v.dst else {
-                    return Err("v_swap_b32 outside a VGPR");
-                };
-                let Some(&Operand::Vector { reg: src, .. }) = v.src.first() else {
-                    return Err("v_swap_b32 from a non-VGPR");
-                };
-                let read_vgpr = |l: &mut Self, r: u8| -> Result<V, Why> {
-                    match inst.read(Reg::V(r)) {
-                        Some(o) => l.i32_of(o),
-                        None => Ok(l.s.m.i32(0)),
-                    }
-                };
-                let old_dst = read_vgpr(self, dst)?;
-                let old_src = read_vgpr(self, src)?;
-                self.write(inst, Reg::V(dst), old_src, guard);
-                if dst != src {
-                    self.write(inst, Reg::V(src), old_dst, guard);
-                }
-                Ok(())
-            }
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
@@ -7179,16 +7164,6 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-    }
-
-    fn join64(&mut self, lo: V, hi: V) -> V {
-        let c = self.cur;
-        let ty = self.s.m.int(64);
-        let lo = self.s.m.cast(c, Cast::ZExt, lo, ty);
-        let hi = self.s.m.cast(c, Cast::ZExt, hi, ty);
-        let k32 = self.s.m.int_const(ty, 32);
-        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
-        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     fn extend64(&mut self, x: V, signed: bool) -> V {
@@ -10712,6 +10687,7 @@ impl<'a> Lower<'a> {
         let last = wave_max(self, rank);
         let mine = self.s.m.cmp(c, pred::EQ, rank, last);
         self.s.flags |= flags::WAVE_OPS;
+        self.s.wave_size = Some(self.wave());
         let zero = self.s.m.i32(0);
         for i in joins {
             let v = p.blocks[b].phis[i].value;
@@ -10747,6 +10723,28 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         for (h, values) in loops {
+            let live_values: Vec<(Value, Val)> = values
+                .into_iter()
+                .filter_map(|v| match self.vals.get(&v).copied() {
+                    Some(val @ (Val::I32(_) | Val::Bit(_))) => Some((v, val)),
+                    _ => None,
+                })
+                .collect();
+            let live_phis: Vec<(Value, Val)> = self.x.p.blocks[b]
+                .phis
+                .iter()
+                .filter(|phi| {
+                    matches!(phi.reg, Reg::S(r) if r != EXEC && r != EXEC + 1)
+                        || phi.reg == Reg::Scc
+                })
+                .filter_map(|phi| match self.vals.get(&phi.value).copied() {
+                    Some(val @ (Val::I32(_) | Val::Bit(_))) => Some((phi.value, val)),
+                    _ => None,
+                })
+                .collect();
+            if live_values.is_empty() && live_phis.is_empty() {
+                continue;
+            }
             let (count, _) = self.counters[&h];
             let (max, unsigned) = (self.s.m.i8(3), self.s.m.i8(1));
             let wave_max = |l: &mut Self, x: V| {
@@ -10762,9 +10760,10 @@ impl<'a> Lower<'a> {
             let last = wave_max(self, count);
             let mine = self.s.m.cmp(c, pred::EQ, count, last);
             self.s.flags |= flags::WAVE_OPS;
+            self.s.wave_size = Some(self.wave());
             let zero = self.s.m.i32(0);
-            let final_of = |l: &mut Self, val: Val| -> Option<Val> {
-                Some(match val {
+            let final_of = |l: &mut Self, val: Val| -> Val {
+                match val {
                     Val::I32(x) => {
                         let x = l.s.m.select(c, mine, x, zero);
                         Val::I32(wave_max(l, x))
@@ -10775,29 +10774,17 @@ impl<'a> Lower<'a> {
                         let w = wave_max(l, x);
                         Val::Bit(l.s.m.cmp(c, pred::NE, w, zero))
                     }
-                    Val::Missing(_) => return None,
-                })
-            };
-            for v in values {
-                let Some(val) = self.vals.get(&v).copied() else {
-                    continue;
-                };
-                if let Some(f) = final_of(self, val) {
-                    self.finals.insert(v, (f, h));
+                    Val::Missing(_) => unreachable!(),
                 }
+            };
+            for (v, val) in live_values {
+                let f = final_of(self, val);
+                self.finals.insert(v, (f, h));
             }
             // This block's joins of the loop's scalars.
-            for phi in &self.x.p.blocks[b].phis {
-                let scalar = matches!(phi.reg, Reg::S(r) if r != EXEC && r != EXEC + 1)
-                    || phi.reg == Reg::Scc;
-                if !scalar {
-                    continue;
-                }
-                if let Some(val) = self.vals.get(&phi.value).copied()
-                    && let Some(f) = final_of(self, val)
-                {
-                    self.vals.insert(phi.value, f);
-                }
+            for (v, val) in live_phis {
+                let f = final_of(self, val);
+                self.vals.insert(v, f);
             }
         }
     }
@@ -11405,6 +11392,28 @@ mod tests {
     }
 
     #[test]
+    fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
+        // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
+        let src0 = 256 + 1u32;
+        let src1 = 256 + 2u32;
+        let src2 = 256 + 3u32;
+        let words = [
+            0x35 << 26 | (0x157u32 << 16),
+            src0 | (src1 << 9) | (src2 << 18),
+            S_ENDPGM,
+        ];
+        let lowered = lowers_cs(&words, false, 0).unwrap();
+        assert!(
+            lowered.has_isnan_op,
+            "v_med3_f32 must emit dx.op.isSpecialFloat.f32 (IsNaN)"
+        );
+        assert!(
+            !lowered.has_fcmp_uno,
+            "v_med3_f32 must not emit fcmp uno (folded away by some drivers)"
+        );
+    }
+
+    #[test]
     fn lane_mask_phi_joining_zero_and_compare_lowers() {
         let cnd = 0x81 | (0x82 << 9) | (2 << 18); // v_cndmask_b32 v1, 1, 2, s2
         let words = [
@@ -11796,6 +11805,7 @@ mod tests {
         let st = structure::structure(&p).unwrap();
 
         let emitted = lower(&Parts {
+            psv: None,
             native: &native,
             p: &p,
             st: &st,
@@ -12109,7 +12119,7 @@ mod tests {
             0x0000_0100,
             S_ENDPGM,
         ];
-        lowers_with(&words, 1 << 15).unwrap();
+        lower_with(&words, vec![], vec![]).unwrap();
     }
 
     #[test]

@@ -319,8 +319,8 @@ mod tests {
     }
 
     /// Translates a Wave64 compute program, with or without forwarding
-    /// reloads first.
-    fn translate(words: &[u32], fwd: bool) -> Result<(), ShaderError> {
+    /// reloads first. Returns the required wave size from `PSV0` (0 = none).
+    fn translate(words: &[u32], fwd: bool) -> Result<u32, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: true,
@@ -342,7 +342,10 @@ mod tests {
         let st = structure::structure(&p)?;
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        crate::emit::emit(&c, &native, &p, &st, &io, &res).map(|_| ())
+        let shader = crate::emit::emit(&c, &native, &p, &st, &io, &res)?;
+        let out = Container::parse(&shader.dxil).unwrap();
+        let psv = out.part(crate::FourCC::PSV0).unwrap();
+        Ok(u32::from_le_bytes(psv.data[20..24].try_into().unwrap()))
     }
 
     /// Assembled with llvm-mc (gfx1030, wave64): an `if` whose else-mask
@@ -435,12 +438,15 @@ mod tests {
         ];
         for uses in idioms {
             let words = else_mask_spilled(uses);
-            // The spill reads the mask as a number where its lanes are not.
+            // Without forwarding, spilling the else-mask either fails on a mask
+            // holding lanes elsewhere or forces a fixed Wave64 shader (#269).
             match translate(&words, false) {
                 Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, HOLDING),
+                Ok(wave_size) => assert_eq!(wave_size, 64),
                 r => panic!("{r:?}"),
             }
-            translate(&words, true).unwrap();
+            // Forwarding restores the structured mask directly without needing Wave64.
+            assert_eq!(translate(&words, true).unwrap(), 0);
         }
     }
 
