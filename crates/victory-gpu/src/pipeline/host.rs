@@ -1634,8 +1634,10 @@ float4 ps(V input) : SV_Target { return input.color; }
             shader("geometry", Gs, Program::Gs, s!("gs"), s!("gs_5_1")),
             shader("pixel", Ps, Program::Main, s!("ps"), s!("ps_5_1")),
         ];
-        let mut graphics = GraphicsState::default();
-        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        let mut graphics = GraphicsState {
+            topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            ..Default::default()
+        };
         graphics.depth.DepthEnable = false.into();
         graphics.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
         graphics.targets.NumRenderTargets = 1;
@@ -1762,7 +1764,7 @@ float4 ps(V input) : SV_Target { return input.color; }
                 let row =
                     std::slice::from_raw_parts(texel.add(y * fp.Footprint.RowPitch as usize), 32);
                 assert!(
-                    row.chunks_exact(4).all(|rgba| rgba == [255, 0, 0, 255]),
+                    row.as_chunks::<4>().0.iter().all(|&rgba| rgba == [255, 0, 0, 255]),
                     "topology {topology}, row {y}"
                 );
             }
