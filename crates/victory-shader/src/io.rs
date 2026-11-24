@@ -690,4 +690,61 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_raise_io() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let compute = NativeProgram {
+            stage: HwStage::Cs,
+            io: StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 0,
+                threads: [32, 1, 1],
+            }),
+            ..pixel(vec![], 0)
+        };
+        let pixel = pixel(vec![TEXCOORD], 2);
+        for (label, native, prefix, suffix) in [
+            ("compute", &compute, &[][..], &[][..]),
+            (
+                "pixel vertex sample",
+                &pixel,
+                &[0xC80A_0002][..],
+                &[0xF800_0801, 2][..],
+            ),
+            (
+                "pixel interpolation pair",
+                &pixel,
+                &[0xC808_0000, 0xC809_0001][..],
+                &[0xF800_0801, 2][..],
+            ),
+        ] {
+            for instructions in [64, 512, 4096] {
+                let mut words = prefix.to_vec();
+                // Mix vector and scalar ALU writes without disturbing v0-v2.
+                words.extend(
+                    [0x0606_0703, 0x0608_0904, 0x8000_8100, 0x060A_0B05].repeat(instructions / 4),
+                );
+                words.extend_from_slice(suffix);
+                words.push(S_ENDPGM);
+                let p = program(&words);
+                let iterations = 2_000_000 / instructions;
+                let mut samples = [0.; 7];
+                for sample in &mut samples {
+                    let start = Instant::now();
+                    for _ in 0..iterations {
+                        black_box(raise(black_box(&p), black_box(native)).unwrap());
+                    }
+                    *sample = start.elapsed().as_secs_f64() * 1e9 / iterations as f64;
+                }
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "{label:24} {instructions:4} ALU instructions: {:>10.1} ns/raise",
+                    samples[3]
+                );
+            }
+        }
+    }
 }
