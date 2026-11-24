@@ -17,6 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -96,9 +97,26 @@ enum HostWritten {
     Sticky,
 }
 
+/// A GPU copy or resolve recorded on a command list, committed to
+/// [`HOST_WRITTEN`] only once that list actually executes.
+pub(crate) struct PendingHostWrite {
+    key: usize,
+    span: Option<(usize, usize)>,
+    alive: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct HostWrites {
+    entries: HashMap<usize, HostWritten>,
+    /// Liveness token per resource with a pending or committed host write.
+    /// Flipped to `false` by [`forget`] so a list submitted after the resource
+    /// was released neither reads freed memory nor poisons a reused address.
+    alive: HashMap<usize, Arc<AtomicBool>>,
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents live on
 /// the host until the title writes their console memory again.
-static HOST_WRITTEN: Mutex<Option<HashMap<usize, HostWritten>>> = Mutex::new(None);
+static HOST_WRITTEN: Mutex<Option<HostWrites>> = Mutex::new(None);
 
 /// Console memory pointer and layout byte size for a title-written, detileable
 /// texture. Returns `None` for render targets, depth/UAV textures, buffers, or
@@ -143,11 +161,35 @@ fn hash_unwatched(memory: *const u8, size: usize) -> Option<blake3::Hash> {
     Some(hasher.finalize())
 }
 
-/// A host copy or resolve writes `resource`.
-pub(crate) fn host_written(resource: This) {
-    let state = match texture_span(resource) {
-        Some((memory, size)) => {
-            let start = memory as usize;
+/// Records that a host copy or resolve on `list` writes `resource`.
+///
+/// Marks `resource` used on `list` immediately so a later [`upload`] in the
+/// same command list will not overwrite the copy, but defers updating the
+/// global [`HOST_WRITTEN`] map until `list` actually executes so discarded or
+/// unsubmitted command lists do not suppress later title uploads.
+pub(crate) fn host_written(list: &HostList, resource: This) {
+    let key = resource as usize;
+    list.first_use(key);
+    let span = texture_span(resource).map(|(memory, size)| (memory as usize, size));
+    let alive = {
+        let mut guard = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get_or_insert_with(HostWrites::default)
+            .alive
+            .entry(key)
+            .or_insert_with(|| Arc::new(AtomicBool::new(true)))
+            .clone()
+    };
+    list.defer_host_write(PendingHostWrite { key, span, alive });
+}
+
+/// Commits a recorded host copy or resolve after its command list has run.
+pub(crate) fn commit_host_write(pending: &PendingHostWrite) {
+    if !pending.alive.load(Ordering::Acquire) {
+        return;
+    }
+    let state = match pending.span {
+        Some((start, size)) => {
             if let Some(end) = start.checked_add(size) {
                 if let Some((at, _)) = crate::watch::writes(start, end, false) {
                     HostWritten::Watched { start, end, at }
@@ -155,7 +197,7 @@ pub(crate) fn host_written(resource: This) {
                     HostWritten::Hashed {
                         memory: start,
                         size,
-                        hash: hash_unwatched(memory, size),
+                        hash: hash_unwatched(start as *const u8, size),
                     }
                 }
             } else {
@@ -164,9 +206,13 @@ pub(crate) fn host_written(resource: This) {
         }
         None => HostWritten::Sticky,
     };
-    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    map.get_or_insert_with(HashMap::new)
-        .insert(resource as usize, state);
+    let mut guard = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.alive.load(Ordering::Acquire) {
+        guard
+            .get_or_insert_with(HostWrites::default)
+            .entries
+            .insert(pending.key, state);
+    }
 }
 
 /// Whether `resource` still holds host-written contents (no title write to its
@@ -174,8 +220,8 @@ pub(crate) fn host_written(resource: This) {
 fn still_host_written(resource: This) -> bool {
     let key = resource as usize;
     let state = {
-        let map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(&state) = map.as_ref().and_then(|m| m.get(&key)) else {
+        let guard = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&state) = guard.as_ref().and_then(|hw| hw.entries.get(&key)) else {
             return false;
         };
         state
@@ -194,11 +240,11 @@ fn still_host_written(resource: This) -> bool {
         }
     };
     if !unchanged {
-        let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(map) = map.as_mut()
-            && map.get(&key) == Some(&state)
+        let mut guard = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hw) = guard.as_mut()
+            && hw.entries.get(&key) == Some(&state)
         {
-            map.remove(&key);
+            hw.entries.remove(&key);
         }
     }
     unchanged
@@ -210,9 +256,12 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    let mut guard = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hw) = guard.as_mut() {
+        hw.entries.remove(&resource);
+        if let Some(alive) = hw.alive.remove(&resource) {
+            alive.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -1062,7 +1111,7 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), mem, size) };
     }
 
-    fn copy_buffer_to_texture(queue: This, allocator: This, list: This, dst: This, linear: &[u8]) {
+    fn record_buffer_to_texture(list: This, dst: This, linear: &[u8]) -> This {
         let src = test_buffer(linear.len() as u64);
         let (data, _) = buffer_bytes(src).expect("buffer bytes");
         // SAFETY: `src` is a committed buffer of `linear.len()` bytes.
@@ -1086,6 +1135,11 @@ mod tests {
             slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
             S_OK
         );
+        src
+    }
+
+    fn copy_buffer_to_texture(queue: This, allocator: This, list: This, dst: This, linear: &[u8]) {
+        let src = record_buffer_to_texture(list, dst, linear);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
         assert_eq!(
             slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
@@ -1384,12 +1438,202 @@ mod tests {
         assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
     }
 
+    /// A recorded buffer-to-texture copy that is discarded or reset without
+    /// ever executing must not mark the texture host-written or suppress
+    /// uploading new title pixels (both unwatched and write-watched memory).
+    #[test]
+    fn unsubmitted_texture_copy_does_not_suppress_title_upload() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let Some(host) = host() else {
+            return;
+        };
+        for watched in [false, true] {
+            let mut backing = vec![0u8; 64 << 10];
+            let mem = if watched {
+                // SAFETY: fresh write-watched allocation, freed after release.
+                let p = unsafe {
+                    VirtualAlloc(
+                        std::ptr::null(),
+                        64 << 10,
+                        MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                        PAGE_READWRITE,
+                    )
+                }
+                .cast::<u8>();
+                assert!(!p.is_null());
+                p
+            } else {
+                backing.as_mut_ptr()
+            };
+            let image = test_texture_at(mem as u64, u64::from(W), H, RGBA8, 0);
+            let (_, desc) = texture_memory(image).expect("texture memory");
+            let layout_size = texture_layout(&desc).expect("layout").planes[0].layout.size as usize;
+            assert!(layout_size <= 64 << 10);
+
+            let old = pattern(0x10);
+            let title = pattern(0x50);
+            let unused_copy = pattern(0x90);
+            let title_after_reset = pattern(0xd0);
+
+            write_tiled(image, mem, layout_size, &old);
+            run_upload(host, image);
+
+            // Title writes new pixels, then records and discards a copy list
+            // without submitting it.
+            write_tiled(image, mem, layout_size, &title);
+            let (queue, allocator, list) = make_queue_and_list();
+            let src = record_buffer_to_texture(list, image, &unused_copy);
+            assert_eq!(slot::<Release>(list, 0x10)(list), 0);
+            assert_eq!(slot::<Release>(src, 0x10)(src), 0);
+            assert_eq!(slot::<Release>(allocator, 0x10)(allocator), 0);
+            assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
+
+            run_upload(host, image);
+            assert_rows_eq(
+                &read_back(host, image),
+                &title,
+                if watched {
+                    "discarded copy (watched)"
+                } else {
+                    "discarded copy (unwatched)"
+                },
+            );
+
+            // Recording and resetting a list without submitting also must not
+            // mark the texture host-written.
+            write_tiled(image, mem, layout_size, &title_after_reset);
+            let (queue, allocator, list) = make_queue_and_list();
+            let src = record_buffer_to_texture(list, image, &unused_copy);
+            assert_eq!(
+                slot::<extern "system" fn(This, This, This) -> HRESULT>(list, 0x50)(
+                    list,
+                    allocator,
+                    std::ptr::null(),
+                ),
+                S_OK
+            );
+            run_upload(host, image);
+            assert_rows_eq(
+                &read_back(host, image),
+                &title_after_reset,
+                if watched {
+                    "reset copy (watched)"
+                } else {
+                    "reset copy (unwatched)"
+                },
+            );
+
+            assert_eq!(slot::<Release>(src, 0x10)(src), 0);
+            assert_eq!(slot::<Release>(list, 0x10)(list), 0);
+            assert_eq!(slot::<Release>(allocator, 0x10)(allocator), 0);
+            assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
+            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+            if watched {
+                // SAFETY: `image` is released; freeing our allocation.
+                unsafe { VirtualFree(mem.cast(), 0, MEM_RELEASE) };
+            }
+        }
+    }
+
+    /// A texture written by a GPU copy and then sampled in the same command
+    /// list must keep the GPU-copied pixels instead of overwriting them with a
+    /// staging upload, and still resume uploading after a later title write.
+    #[test]
+    fn same_list_upload_after_copy_keeps_gpu_copy() {
+        let Some(host) = host() else {
+            return;
+        };
+        let mut backing = vec![0u8; 64 << 10];
+        let mem = backing.as_mut_ptr();
+        let image = test_texture_at(mem as u64, u64::from(W), H, RGBA8, 0);
+        let (_, desc) = texture_memory(image).expect("texture memory");
+        let layout_size = texture_layout(&desc).expect("layout").planes[0].layout.size as usize;
+
+        let initial = pattern(0x10);
+        let copied = pattern(0x70);
+        let later_title = pattern(0xb0);
+        write_tiled(image, mem, layout_size, &initial);
+        run_upload(host, image);
+
+        let (queue, allocator, list) = make_queue_and_list();
+        let src = test_buffer(copied.len() as u64);
+        let (data, _) = buffer_bytes(src).expect("buffer bytes");
+        // SAFETY: `src` is a committed buffer of `copied.len()` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(copied.as_ptr(), data, copied.len()) };
+
+        let rows = rows_footprint();
+        let to = Location {
+            resource: image,
+            kind: 0,
+            footprint: rows,
+        };
+        let from = Location {
+            resource: src,
+            kind: 1,
+            footprint: rows,
+        };
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        slot::<Copy>(list, 0x80)(list, &to, 0, 0, 0, &from, std::ptr::null());
+        // Simulate sampling the texture later in the same command list.
+        let host_list = crate::list::host_list(list).expect("host list");
+        let host_tex = host_resource(image).expect("host texture");
+        upload(host_list, image, host_tex);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        assert_rows_eq(
+            &read_back(host, image),
+            &copied,
+            "same-list copy then upload",
+        );
+
+        write_tiled(image, mem, layout_size, &later_title);
+        run_upload(host, image);
+        assert_rows_eq(&read_back(host, image), &later_title, "later title write");
+
+        assert_eq!(slot::<Release>(src, 0x10)(src), 0);
+        assert_eq!(slot::<Release>(list, 0x10)(list), 0);
+        assert_eq!(slot::<Release>(allocator, 0x10)(allocator), 0);
+        assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
+        assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+    }
+
+    /// Releasing a texture after recording a copy but before submitting its
+    /// list must not leave a stale `HOST_WRITTEN` entry behind.
+    #[test]
+    fn released_texture_pending_host_write_is_ignored_on_submit() {
+        let Some(_) = host() else {
+            return;
+        };
+        let mut backing = vec![0u8; 64 << 10];
+        let image = test_texture_at(backing.as_mut_ptr() as u64, u64::from(W), H, RGBA8, 0);
+        let (queue, allocator, list) = make_queue_and_list();
+        let src = record_buffer_to_texture(list, image, &pattern(0x33));
+        // Release the title resource before executing the list (the list still
+        // keeps the underlying host ID3D12Resource alive via `states`).
+        assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        assert!(!still_host_written(image));
+
+        assert_eq!(slot::<Release>(src, 0x10)(src), 0);
+        assert_eq!(slot::<Release>(list, 0x10)(list), 0);
+        assert_eq!(slot::<Release>(allocator, 0x10)(allocator), 0);
+        assert_eq!(slot::<Release>(queue, 0x10)(queue), 0);
+    }
+
     /// Non-title-written textures (such as render targets) stay sticky in
-    /// `HOST_WRITTEN` without hashing or write-watch queries, and clear on
-    /// release.
+    /// `HOST_WRITTEN` once submitted without hashing or write-watch queries,
+    /// and clear on release.
     #[test]
     fn host_written_render_target_stays_sticky_until_forgotten() {
-        let Some(_) = host() else {
+        let Some(host) = host() else {
             return;
         };
         let mut backing = vec![0u8; 64 << 10];
@@ -1401,7 +1645,11 @@ mod tests {
             RGBA8,
             ALLOW_RENDER_TARGET,
         );
-        host_written(rt);
+        let list = host.new_list().expect("new host list");
+        host_written(&list, rt);
+        assert!(!still_host_written(rt), "not committed until submitted");
+        list.close();
+        host.execute(&[&list]);
         assert!(still_host_written(rt));
         backing[0] ^= 0xff;
         assert!(still_host_written(rt));

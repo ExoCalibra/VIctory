@@ -519,7 +519,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
+            crate::texture::host_written(list, dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -814,7 +814,7 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_written(dst.resource);
+        crate::texture::host_written(list, dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         #[cfg(feature = "diagnostics")]
@@ -898,7 +898,7 @@ extern "system" fn resolve(
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_written(dst);
+        crate::texture::host_written(list, dst);
         let format = crate::resource::target_format(format);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
