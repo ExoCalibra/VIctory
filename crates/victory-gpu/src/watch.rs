@@ -139,12 +139,17 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks found to be in a view when an asking began there, until the
+    /// runtime remaps them. Asking the system each time (`VirtualQuery`)
+    /// cost 100-230 ms per world frame, more than the rest of the guard.
+    views: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    views: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -155,14 +160,18 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    if !mapped(start) {
-        return None;
-    }
     install();
     let mut g = guards();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Asked under the lock: a remap in between would leave a stale view.
+    if !g.views.contains(&first) {
+        if !mapped(start) {
+            return None;
+        }
+        g.views.insert(first);
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     let mut uncommitted_until = first;
     for block in first..=last {
         let mut open = block < last && !g.clean.contains(&block);
@@ -203,6 +212,8 @@ fn mapped(at: usize) -> bool {
         VirtualQuery, WIN32_MEMORY_REGION_INFORMATION,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(test)]
+    tests::QUERIED.with(|n| n.set(n.get() + 1));
 
     let mut region = WIN32_MEMORY_REGION_INFORMATION::default();
     // SAFETY: both queries describe an address without dereferencing it. The
@@ -333,6 +344,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         for block in absent {
             g.absent.remove(&block);
         }
+        let views: Vec<usize> = g.views.range(range.clone()).copied().collect();
+        for block in views {
+            g.views.remove(&block);
+        }
         let blocks: Vec<usize> = g.protected.range(range).copied().collect();
         for block in blocks {
             g.protected.remove(&block);
@@ -408,10 +423,17 @@ mod tests {
         /// The kernel askings `writes` made on this thread (each test runs
         /// on its own).
         pub(super) static KERNEL_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// The view queries `guard` made on this thread (each test runs on
+        /// its own).
+        pub(super) static QUERIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     fn kernel_asked() -> usize {
         KERNEL_ASKED.with(|n| n.get())
+    }
+
+    fn queried() -> usize {
+        QUERIED.with(|n| n.get())
     }
 
     /// A pagefile section of `blocks` blocks, mapped read-write.
@@ -560,6 +582,55 @@ mod tests {
         assert!(!mapped((&raw const file) as usize)); // private stack allocation
         assert!(!mapped(mapped as *const () as usize)); // executable image
         assert!(!mapped(0)); // no allocation to query
+    }
+
+    /// A view is asked about once per block an asking starts in, again
+    /// only after the runtime remapped it; other memory every time.
+    #[test]
+    fn views_are_queried_once_until_remapped() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let at = queried();
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert!(guard(view + 8, view + BLOCK).is_some());
+        assert_eq!(queried(), at + 1);
+        // Another start block is asked about once.
+        assert!(guard(view + BLOCK, view + 2 * BLOCK).is_some());
+        assert!(guard(view + BLOCK, view + 2 * BLOCK).is_some());
+        assert_eq!(queried(), at + 2);
+        // The runtime remapped the first block: asked again.
+        title_memory_remapped(view, BLOCK);
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        assert_eq!(queried(), at + 3);
+        // Private memory is not a view, however often asked.
+        let plain = vec![0u8; 2 * BLOCK];
+        let p = plain.as_ptr() as usize;
+        assert!(guard(p, p + 16).is_none());
+        assert!(guard(p, p + 16).is_none());
+        assert_eq!(queried(), at + 5);
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            })
+        };
+        title_memory_remapped(view, 2 * BLOCK);
     }
 
     #[test]
