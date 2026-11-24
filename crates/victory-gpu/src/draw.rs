@@ -2381,7 +2381,7 @@ fn view_kind(view: &View) -> Option<ResourceType> {
     }
 }
 
-fn readable(
+pub(crate) fn readable(
     list: &HostList,
     kind: ResourceType,
     view: &View,
@@ -2393,6 +2393,7 @@ fn readable(
     } else {
         crate::producers::read(view);
     }
+    const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -3584,6 +3585,66 @@ mod address_srv_tests {
         assert!(!state.table_failed);
         assert_eq!(made.len(), 1, "CBV padded past shadow end must use dynamic slots");
 
+        list.close();
+    }
+
+    #[test]
+    fn placed_uav_texture_transitions_to_unordered_access_and_placed_srv_to_shader_resource() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let backing = Box::leak(Box::new([0x33u8; 256]));
+        let va = backing.as_ptr() as u64;
+        let resource = [3u32, 0, 0, 0, 4, 0, 4, 1 | (1 << 16), 28, 1, 0, 0, 4, 0];
+        let mut uav_desc = [0u32; 16];
+        uav_desc[0] = 28;
+        uav_desc[1] = 4; // D3D12_UAV_DIMENSION_TEXTURE2D
+        uav_desc[10] = va as u32;
+        uav_desc[11] = (va >> 32) as u32;
+        let mut srv_desc = [0u32; 16];
+        srv_desc[0] = 28;
+        srv_desc[1] = 4; // D3D12_SRV_DIMENSION_TEXTURE2D
+        srv_desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc[5] = 1; // MipLevels
+        srv_desc[10] = va as u32;
+        srv_desc[11] = (va >> 32) as u32;
+
+        let list = host.new_list().unwrap();
+        readable(
+            &list,
+            ResourceType::Uav,
+            &View::Placed(true, resource, uav_desc),
+            None,
+        );
+        let tex = crate::resource::texture_at(va, &resource)
+            .expect("placed UAV texture should resolve to a host texture");
+        let mut before_uav = None;
+        list.transition(tex, 0x800, None, |_, _, before, _| {
+            before_uav = Some(before);
+        });
+        assert_eq!(
+            before_uav,
+            Some(0x8),
+            "placed UAV should place the texture in UNORDERED_ACCESS"
+        );
+
+        readable(
+            &list,
+            ResourceType::Srv,
+            &View::Placed(false, resource, srv_desc),
+            None,
+        );
+        let mut before_srv = None;
+        list.transition(tex, 0x800, None, |_, _, before, _| {
+            before_srv = Some(before);
+        });
+        assert_eq!(
+            before_srv,
+            Some(0xC0),
+            "placed SRV of a UAV texture should transition to SHADER_RESOURCE without CPU upload"
+        );
+        let host_tex = crate::resource::host_resource(tex).unwrap();
+        assert!(!crate::texture::title_written(host_tex));
         list.close();
     }
 }
