@@ -152,8 +152,9 @@ fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError
 /// Resolves the far jump compilers emit beyond the reach of a branch offset:
 /// `s_getpc_b64 s[n:n+1]`, `s_add_u32|s_sub_u32 sn, sn, literal`, a carry
 /// into s(n+1), `s_setpc_b64 s[n:n+1]`, looking back over the straight-line
-/// run just decoded. Any other `s_setpc_b64` (e.g. a handover to the next
-/// merged stage through registers) gives `None`.
+/// run just decoded. Another write to s[n:n+1] in that run sends the jump
+/// elsewhere, so it is not resolved. Any other `s_setpc_b64` (e.g. a
+/// handover to the next merged stage through registers) gives `None`.
 fn far_jump<'a>(
     before: impl Fn(usize) -> Option<&'a Instruction>,
     setpc: &Instruction,
@@ -189,11 +190,35 @@ fn far_jump<'a>(
                     .map(Some)
                     .ok_or(isa(setpc.offset, "far jump target outside the code"));
             }
+            // The carry into the high dword.
+            (Encoding::Sop2, Some("s_addc_u32" | "s_subb_u32"))
+                if sdst == n + 1 && ssrc0 == n + 1 && delta.is_none() => {}
+            // Anything else that writes the pair (a second add, a move into
+            // the high dword...) jumps somewhere the pattern does not say.
+            _ if writes_pair(prev, n) => break,
             _ => {}
         }
         at = prev.offset;
     }
     Ok(None)
+}
+
+/// Whether `inst` names sn or s(n+1) as a destination. VALU SGPR results
+/// are read as wave64 masks, which only widens the check.
+fn writes_pair(inst: &Instruction, n: u32) -> bool {
+    let dst = match inst.fields(true) {
+        Fields::Sop { dst, .. } => dst.into_iter().collect(),
+        Fields::Smem { data, .. } => data.into_iter().collect(),
+        Fields::Valu(v) => v.dst.into_iter().chain(v.carry).collect(),
+        _ => Vec::new(),
+    };
+    dst.iter().any(|d| match *d {
+        Operand::Scalar { code, dwords } => {
+            let (lo, hi) = (u32::from(code), u32::from(code) + u32::from(dwords));
+            lo <= n + 1 && n < hi
+        }
+        _ => false,
+    })
 }
 
 fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
@@ -531,5 +556,43 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    #[test]
+    fn a_far_jump_whose_registers_change_is_not_resolved() {
+        // s_getpc_b64 s[8:9]; s_add_u32 s8, s8, lit; s_addc_u32 s9, s9, 0;
+        // `between`; s_setpc_b64 s[8:9]; junk; s_endpgm, with the literal
+        // aimed at the s_endpgm. Returns whether the jump was followed.
+        let followed = |between: &[u32]| {
+            let lit = 4 * (5 + between.len() as u32);
+            let mut code = vec![0xBE88_1F00, 0x8008_FF08, lit, 0x8209_8009];
+            code.extend(between);
+            code.extend([0xBE80_2008, 0xFFFF_FFFF, S_ENDPGM]);
+            let found = summary(&code);
+            let end = found.last().unwrap();
+            match end.2 {
+                "s_endpgm" => {
+                    assert_eq!(end.0, 4 + lit as usize);
+                    true
+                }
+                name => {
+                    assert_eq!(name, "s_setpc_b64");
+                    false
+                }
+            }
+        };
+        assert!(followed(&[]));
+        // Writes to other registers leave the jump alone.
+        assert!(followed(&[0xBE8A_0380])); // s_mov_b32 s10, 0
+        assert!(followed(&[0x7E0E_0500])); // v_readfirstlane_b32 s7, v0
+        // Writes to the pair change where it goes: an indirect jump.
+        assert!(!followed(&[0x8008_FF08, 16])); // s_add_u32 s8, s8, 16
+        assert!(!followed(&[0xBE89_0380])); // s_mov_b32 s9, 0
+        assert!(!followed(&[0xBE88_0480])); // s_mov_b64 s[8:9], 0
+        assert!(!followed(&[0xBE87_0480])); // s_mov_b64 s[7:8], 0
+        assert!(!followed(&[0x7E12_0500])); // v_readfirstlane_b32 s9, v0
+        assert!(!followed(&[0xF400_0200, 0xFA00_0000])); // s_load_dword s8, s[0:1], 0
+        // The carry must go into the high dword.
+        assert!(!followed(&[0x8208_8008])); // s_addc_u32 s8, s8, 0
     }
 }
