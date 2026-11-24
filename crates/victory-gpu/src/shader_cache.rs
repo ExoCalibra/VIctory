@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{AddressView, HostShader, StaticSampler, Target, UserData};
+use victory_shader::emit::{AddressView, HostShader, StaticSampler, TableView, Target, UserData};
 use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
@@ -126,8 +126,8 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        // Bumped with MAGIC when the encoded HostShader layout changes.
+        2
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
@@ -267,6 +267,12 @@ fn encode(s: &HostShader) -> Vec<u8> {
         user(&mut out, &view.lo);
         user(&mut out, &view.hi);
     }
+    word(&mut out, s.table_views.len() as u32);
+    for v in &s.table_views {
+        for w in [u32::from(v.slot), v.dword, v.props.0, v.props.1] {
+            word(&mut out, w);
+        }
+    }
     out
 }
 
@@ -346,6 +352,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             hi: r.user()?,
         });
     }
+    let n = r.word()? as usize;
+    let mut table_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        table_views.push(TableView {
+            slot: u8::try_from(r.word()?).ok()?,
+            dword: r.word()?,
+            props: (r.word()?, r.word()?),
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -357,6 +372,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         root_indexed_views,
         address_srvs,
+        table_views,
     })
 }
 
@@ -405,6 +421,18 @@ mod tests {
                     dword: 0,
                 },
             }],
+            table_views: vec![
+                TableView {
+                    slot: 1,
+                    dword: 8,
+                    props: (11 | 0x1000, 0),
+                },
+                TableView {
+                    slot: 1,
+                    dword: 16,
+                    props: (12 | 0x1000, 32),
+                },
+            ],
         }
     }
 
@@ -480,5 +508,6 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        assert_eq!(decode(b"VSH1"), None);
     }
 }

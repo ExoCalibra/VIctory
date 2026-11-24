@@ -230,6 +230,10 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) at addresses in root constants: `t<n>` in
     /// [`ROOT_ADDRESS_SPACE`] for the view at position n.
     pub address_srvs: Vec<AddressView>,
+    /// Table descriptors loaded at constant offsets, with the DXIL resource
+    /// properties the shader annotates them with (sorted by `(slot, dword)`,
+    /// deduplicated; UAV annotations take precedence).
+    pub table_views: Vec<TableView>,
 }
 
 /// A root SRV at the 64-bit address two root-constant dwords hold (both
@@ -328,6 +332,19 @@ impl Default for Target {
 /// a module the validator refuses. Nothing of the console program is in it.
 pub fn last_module_summary() -> String {
     shader::last_summary()
+}
+
+/// One table descriptor loaded at a constant offset and the DXIL resource
+/// properties (`dx.types.ResourceProperties`) the shader annotates it with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableView {
+    /// Root parameter index of the descriptor table.
+    pub slot: u8,
+    /// Dword offset of the descriptor within the table.
+    pub dword: u32,
+    /// Resource kind and flags (UAV bit `0x1000`) in `.0`; component
+    /// type/count or structure stride in `.1`.
+    pub props: (u32, u32),
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -574,6 +591,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
         address_srvs: l.address_srvs,
+        table_views: l.table_views,
     })
 }
 
@@ -1513,6 +1531,7 @@ mod tests {
             root_uavs: Vec::new(),
             address_srvs: Vec::new(),
             root_indexed_views: Vec::new(),
+            table_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1526,6 +1545,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
                 address_srvs: Vec::new(),
+                table_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

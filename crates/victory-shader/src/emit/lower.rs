@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
-use super::{AddressView, UserData};
+use super::{AddressView, TableView, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Copied, Export, Input, Interp, Io, Ring, Target};
@@ -102,6 +102,7 @@ pub(crate) struct Lowered {
     pub address_srvs: Vec<AddressView>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    pub table_views: Vec<TableView>,
     /// Back edges that count against the spin-wait limit.
     #[cfg(test)]
     pub spin_loops: usize,
@@ -560,6 +561,7 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     /// Bytes each root view holds, by root parameter (see [`Self::root_view_size`]).
     root_sizes: HashMap<usize, V>,
+    table_views: BTreeMap<(u8, u32), (u32, u32)>,
     samplers: Vec<[u32; 4]>,
     /// Root SRVs at addresses in root constants, in the order of the
     /// shader's `address_srvs`.
@@ -1114,6 +1116,13 @@ impl SubDword {
     }
 }
 
+/// Deterministic preference when the same table slot is annotated with
+/// multiple DXIL `ResourceProperties`: UAV annotations win over non-UAV ones.
+fn prefer_props(cur: (u32, u32), new: (u32, u32)) -> (u32, u32) {
+    let key = |p: (u32, u32)| (p.0 & 0x1000 != 0, p);
+    if key(new) > key(cur) { new } else { cur }
+}
+
 impl<'a> Lower<'a> {
     fn new(
         x: &'a Parts<'a>,
@@ -1511,6 +1520,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             root_sizes: HashMap::new(),
+            table_views: BTreeMap::new(),
             samplers: Vec::new(),
             address_views: Vec::new(),
             descriptors: x
@@ -2441,6 +2451,11 @@ impl<'a> Lower<'a> {
             super::harmonize_row_interp(&mut self.s.inputs);
         }
         let user_data = self.user_reads.values().copied().collect();
+        let table_views = self
+            .table_views
+            .into_iter()
+            .map(|((slot, dword), props)| TableView { slot, dword, props })
+            .collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
@@ -2471,6 +2486,7 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            table_views,
             #[cfg(test)]
             has_isnan_op,
             #[cfg(test)]
@@ -7175,6 +7191,31 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    /// Records the DXIL annotation of a view descriptor loaded from a table at
+    /// a constant offset, so the host can place a matching null descriptor when
+    /// the title has no view at that slot.
+    // shortcut: dynamically indexed table descriptors (`a.dynamic.is_some()`)
+    // are not recorded; their empty slots keep the host's default null view.
+    fn record_table_view(&mut self, load: Site, first: u8, props: (u32, u32)) {
+        let Some(a) = self.scalar.get(&load) else {
+            return;
+        };
+        if a.dynamic.is_some() {
+            return;
+        }
+        let Some(rp) = self.x.native.layout.get(a.param) else {
+            return;
+        };
+        if rp.root != RootType::Table {
+            return;
+        }
+        let dword = (a.offset / 4) + u32::from(first);
+        self.table_views
+            .entry((rp.slot, dword))
+            .and_modify(|cur| *cur = prefer_props(*cur, props))
+            .or_insert(props);
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -7193,6 +7234,9 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
+                if !sampler {
+                    self.record_table_view(*load, *first, props);
+                }
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -7262,6 +7306,7 @@ impl<'a> Lower<'a> {
                 // join picks one with a phi.
                 let _ = site;
                 let mut incoming = Vec::new();
+                let mut loaded = Vec::new();
                 for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
                     if self.block[q].is_none() {
                         continue;
@@ -7274,8 +7319,14 @@ impl<'a> Lower<'a> {
                     let index = self.heap_index(*load, *first, sampler);
                     self.cur = here;
                     incoming.push((index?, at));
+                    loaded.push((*load, *first));
                 }
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                if !sampler {
+                    for (load, first) in loaded {
+                        self.record_table_view(load, first, props);
+                    }
+                }
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
                 Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
