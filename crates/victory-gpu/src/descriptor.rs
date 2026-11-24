@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
 }
@@ -77,9 +77,17 @@ impl Heap {
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
-        if let Some(h) = self.host.get() {
-            return h.as_ref();
-        }
+        self.host_arc_ref().map(std::sync::Arc::as_ref)
+    }
+
+    /// Shared reference to the host heap for submission-time bindless sync.
+    #[cfg(windows)]
+    pub(crate) fn host_arc(&self) -> Option<std::sync::Arc<host::HostHeap>> {
+        self.host_arc_ref().cloned()
+    }
+
+    #[cfg(windows)]
+    fn host_arc_ref(&self) -> Option<&std::sync::Arc<host::HostHeap>> {
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
             return None;
@@ -94,7 +102,7 @@ impl Heap {
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
-                Some(h)
+                Some(std::sync::Arc::new(h))
             })
             .as_ref()
     }
@@ -491,6 +499,8 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    #[cfg(windows)]
+    host::bindless_viewed_changed();
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -504,6 +514,23 @@ pub(crate) fn forget(resource: usize) {
         // `forget` of that resource skips.
         views.free.push(i);
     }
+}
+
+/// Of `entries` (slot, (view entry, generation)), those whose view went
+/// stale: one look at the views for all.
+#[cfg(windows)]
+fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    entries
+        .iter()
+        .filter(|(_, (i, generation))| {
+            views
+                .list
+                .get(*i as usize)
+                .is_none_or(|(_, current)| current != generation)
+        })
+        .copied()
+        .collect()
 }
 
 /// The view of entry `i` if `generation` is still its own.

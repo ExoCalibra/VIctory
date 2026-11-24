@@ -598,6 +598,14 @@ impl State {
             list.keep(&p.root);
         }
         let mut bound_params = 0u64;
+        if p.stages.iter().any(|s| s.translated().resource_heap)
+            && self.heaps[0] != 0
+            && let Some(host_heap) = crate::descriptor::heap(self.heaps[0] as This).host_arc()
+        {
+            host_heap.prepare_bindless_record(list);
+            let writes = p.stages.iter().any(|s| s.translated().writes_memory);
+            list.defer_bindless(&host_heap, writes);
+        }
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
