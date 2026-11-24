@@ -290,7 +290,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
 /// 2^16 ran out seconds into the world (#59, #71).
-const DYNAMIC: u32 = 1 << 19;
+pub(crate) const DYNAMIC: u32 = 1 << 19;
 
 /// Dynamic slots when the host caps the whole view heap at [`PORTABLE_VIEWS`]
 /// (NVIDIA Tier 2/3 1M limit): 2^18 (262,144) leaves 737,856 mirrored title
@@ -306,6 +306,11 @@ const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 const SAMPLER_DYNAMIC: u32 = 256;
 
 impl HostHeap {
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(super) fn retains_resource(&self, index: u32) -> bool {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
+    }
+
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {

@@ -148,6 +148,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -764,6 +765,7 @@ fn build_custom_cs(threads: u32, use_lds: bool, loop_limit: u32, body: &[u32]) -
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
     };
     validate_dxil(&shader.dxil);
     shader
@@ -864,6 +866,7 @@ fn fullscreen_vs() -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     }
 }
 
@@ -970,6 +973,7 @@ fn s_wqm_pixel_loop_and_skip_run_per_quad() {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     };
     let vs = fullscreen_vs();
     let vertices = [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0];
@@ -1512,6 +1516,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: slots.to_vec(),
+            root_indexed_views: Vec::new(),
         }
     };
 
