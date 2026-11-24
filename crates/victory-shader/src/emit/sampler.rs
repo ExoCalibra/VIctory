@@ -4,7 +4,8 @@
 //! Word 0: address modes x, y, z (bits 0-8, 3 each), log2 of the maximum
 //! anisotropy (9-11), comparison function (12-14), reduction (29-30: 0
 //! filtering, 1 minimum, 2 maximum). Word 1: minimum and maximum LOD
-//! (0-11, 12-23, unsigned 4.8). Word 2: LOD bias (0-13, signed 5.8; D3D12
+//! (0-11, 12-23, unsigned 4.8; a maximum below the minimum is raised to it,
+//! since a host sampler needs `MaxLOD >= MinLOD`). Word 2: LOD bias (0-13, signed 5.8; D3D12
 //! takes -16 to 15.99, so the rest of the field's range is clamped),
 //! magnification and minification filters (20-21, 22-23: point, linear,
 //! anisotropic point, anisotropic linear), mip filter (26-27: none, point,
@@ -57,11 +58,16 @@ impl StaticSampler {
             (min & 1) << 4 | (mag & 1) << 2 | u32::from(mip == 2) | reduction << 7
         };
         let lod = |v: u32| v as f32 / 256.0;
-        // Without a mip filter the base level is sampled.
+        // Without a mip filter the base level is sampled. The fields are
+        // independent, so the maximum can sit below the minimum; the hardware
+        // clamp then yields the minimum, which an equal pair also gives, and
+        // a host sampler with `MaxLOD < MinLOD` is invalid (Vulkan's
+        // VUID-VkSamplerCreateInfo-maxLod-01973 under vkd3d-proton).
         let (min_lod, max_lod) = if mip == 0 {
             (0.0, 0.0)
         } else {
-            (lod(bits(w[1], 0, 12)), lod(bits(w[1], 12, 12)))
+            let min = lod(bits(w[1], 0, 12));
+            (min, lod(bits(w[1], 12, 12)).max(min))
         };
         StaticSampler {
             filter,
@@ -140,5 +146,23 @@ mod tests {
         assert_eq!(bias(0x3000), -16.0, "-16 is kept");
         assert_eq!(bias(0x0E80), 14.5, "in range is kept");
         assert_eq!(bias(0x3F80), -0.5, "negative in range is kept");
+    }
+
+    /// The LOD fields are independent; a maximum below the minimum is raised
+    /// to it so the host sampler stays valid, and an ordered pair is kept.
+    #[test]
+    fn max_lod_is_never_below_min_lod() {
+        // Linear mip filter, so the LOD fields are read.
+        let lods = |w1: u32| {
+            let s = StaticSampler::from_words([0, w1, 0x0800_0000, 0]);
+            (s.min_lod, s.max_lod)
+        };
+        assert_eq!(lods(0x0010_0400), (4.0, 4.0), "max 1 below min 4");
+        assert_eq!(lods(0x0000_0FFF), (4095.0 / 256.0, 4095.0 / 256.0));
+        assert_eq!(lods(0x0040_0400), (4.0, 4.0), "equal is kept");
+        assert_eq!(lods(0x0054_0100), (1.0, 5.25), "ordered is kept");
+        // Without a mip filter only the base level is sampled.
+        let base = StaticSampler::from_words([0, 0x0010_0400, 0, 0]);
+        assert_eq!((base.min_lod, base.max_lod), (0.0, 0.0));
     }
 }
