@@ -5989,14 +5989,22 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         // How the program uses the descriptor tells the view's kind: its
-        // own uses, else those of a twin load of the same dwords (a
-        // non-uniform index reloads the descriptor in each waterfall loop,
-        // one for the size bits, another for the access). Prefer an image or
-        // vector buffer use when a descriptor has both scalar and vector uses.
-        let use_at = self.descriptor_uses.get(&site).copied().or_else(|| {
-            twin_load_key(inst, &self.first_lane_src)
-                .and_then(|k| self.twin_descriptor_uses.get(&k).copied())
-        });
+        // own uses, else a sizing waterfall's paired access load (see
+        // `resource::Waterfall`), else a twin load of the same dwords.
+        // Prefer an image or vector buffer use when a descriptor has both
+        // scalar and vector uses.
+        let use_at = self
+            .descriptor_uses
+            .get(&site)
+            .copied()
+            .or_else(|| {
+                let &(_, twin) = self.x.res.waterfall.sizes.iter().find(|s| s.0 == site)?;
+                self.descriptor_uses.get(&twin).copied()
+            })
+            .or_else(|| {
+                twin_load_key(inst, &self.first_lane_src)
+                    .and_then(|k| self.twin_descriptor_uses.get(&k).copied())
+            });
         let (first, src, props, image, uav) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
             let used = self.used_kind(&src);

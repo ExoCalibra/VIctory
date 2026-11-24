@@ -1665,6 +1665,17 @@ mod select_tests {
     }
 
     #[test]
+    fn a_console_waterfall_that_only_sizes_reads_each_lanes_own_dimensions() {
+        use crate::resource::tests::WATERFALL_SIZED_WAVE32;
+        let (layout, used) = texture_and_uav_tables();
+        let l = lower_wave(WATERFALL_SIZED_WAVE32, layout, used, false).unwrap();
+        // The sizing loop's and the sampling loop's handles, both each
+        // lane's own entry.
+        assert_eq!(l.nonuniform_handles, 2);
+        assert!(!l.wave_ops);
+    }
+
+    #[test]
     fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
         use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
         for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
