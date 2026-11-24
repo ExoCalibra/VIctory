@@ -141,9 +141,10 @@ fn lower_test_shader(native: &NativeProgram, parts: &[(crate::FourCC, &[u8])]) -
     let bytes = crate::dxbc::build(parts);
     let container = crate::Container::parse(&bytes).unwrap();
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).unwrap();
-    let io = io::raise(&p, native).unwrap();
-    let st = structure::structure(&p).unwrap();
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
     let shader =
         super::emit(&container, native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
 
