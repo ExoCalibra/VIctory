@@ -6595,6 +6595,8 @@ impl<'a> Lower<'a> {
             }
             4 => (6, 2),
             5 => (7, 3),
+            6 if name == "image_load" || name == "image_get_resinfo" => (3, 2),
+            7 if name == "image_load" || name == "image_get_resinfo" => (8, 3),
             _ => return Err("an image dimension (cube loads or MSAA)"),
         };
         // Address VGPRs in order.
@@ -6811,7 +6813,7 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            let mip = if uav || matches!(kind, 3 | 8) {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -6824,7 +6826,7 @@ impl<'a> Lower<'a> {
             let one = self.s.m.i32(1);
             let present = match kind {
                 1 => [true, false, false, true],
-                2 | 5 | 6 => [true, true, false, true],
+                2 | 3 | 5 | 6 => [true, true, false, true],
                 _ => [true, true, true, true],
             };
             let Operand::Vector { reg, .. } = *data else {
@@ -7324,7 +7326,7 @@ impl<'a> Lower<'a> {
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 *slot = addr_val(self, k)?;
             }
-            let mip = if name == "image_load_mip" {
+            let mip = if name == "image_load_mip" || matches!(kind, 3 | 8) {
                 addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.
@@ -9265,15 +9267,6 @@ mod tests {
         use crate::native::{RootParam, RootType};
 
         for dim in [3u32, 6, 7] {
-            // s_mov_b32 s1, 0
-            // s_load_dwordx8 s[4:11], s[0:1], null
-            // s_lshr_b32 s12, s7, 16        (reads descriptor word 3 as data)
-            // s_cmp_lg_u32 s12, 0
-            // s_cbranch_scc1 -> s_endpgm
-            // s_mov_b32 s13, 0
-            // v_mov_b32 v0..v3, 0
-            // image_get_resinfo (dim) v0, v0, s[4:11]  (op 0x0e, dmask=1)
-            // s_endpgm
             let mimg_w0 = 0xF000_0000 | (0x0E << 18) | (1 << 8) | (dim << 3);
             let words = [
                 0xBE81_0380u32,
@@ -9324,9 +9317,66 @@ mod tests {
                 prims: vec![],
                 mesh_stride: 0,
             });
-            // Cube (3) and MSAA (6, 7) descriptor_data() all lower without failing
-            // on "an image dimension (cube or MSAA)".
             out.unwrap();
+        }
+    }
+
+    #[test]
+    fn msaa_image_load_and_get_resinfo_lower() {
+        use crate::native::{RootParam, RootType};
+
+        for (dim, op) in [(6u32, 0x00u32), (6, 0x0E), (7, 0x00), (7, 0x0E)] {
+            let mimg_w0 = 0xF000_0000 | (op << 18) | (0xF << 8) | (dim << 3);
+            let words = [
+                0xBE81_0380u32,
+                0xF40C_0100,
+                0xFA00_0000,
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                mimg_w0,
+                0x0001_0000,
+                0x7D9A_0080,
+                0xBF81_0000,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                psv: None,
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
         }
     }
 }
@@ -9399,6 +9449,10 @@ mod select_tests {
             let features = emitted.part(FourCC::SFI0).unwrap();
             let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;
             assert_eq!(wave_ops, uses_select);
+=======
+            })
+            .unwrap();
+>>>>>>> 6d7602d (Shaders: lower MSAA image_load and image_get_resinfo)
         }
     }
 }
