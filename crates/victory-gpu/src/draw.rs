@@ -249,14 +249,6 @@ fn emit_uav_barrier(list: &HostList) {
     unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
-/// The bytes of title memory at `address` a root view binds (and shaders
-/// may read: see [`State::root_view_bytes`]).
-fn root_view_len(shadow: &crate::shadow::Shadow, address: u64, srv: bool) -> u64 {
-    shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 })
-}
-
 /// Addresses below this are taken as unset (null, or no buffer): a root SRV
 /// at an address in root constants is not bound there and its draw is
 /// dropped.

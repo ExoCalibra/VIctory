@@ -278,10 +278,13 @@ fn run(
     let (root, pso) = host.compute_pipeline(&s)?;
     let mut data = vec![0; s.user_data_dwords().max(1) as usize];
     for u in &s.user_data {
-        data[u.index as usize] = match u.slot {
-            1 | 2 => 0,
-            3 => 2 * 32,
-            n => panic!("user data of slot {n}"),
+        data[u.index as usize] = match (u.root, u.slot) {
+            (RootType::ResourceHeap | RootType::SamplerHeap, _) => {
+                super::host::guard(u.root, 3, 1).unwrap()
+            }
+            (_, 1 | 2) => 0,
+            (_, 3) => 2 * 32,
+            (_, n) => panic!("user data of slot {n}"),
         };
     }
     let words: Vec<u32> = addr.iter().flatten().copied().collect();

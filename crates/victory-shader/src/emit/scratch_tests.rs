@@ -182,6 +182,7 @@ fn build_cs(body: &[u32], outputs: &[u8]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        address_srvs: lowered.address_srvs,
         root_indexed_views: res.root_indexed_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -216,7 +217,8 @@ fn run(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => k[u.dword as usize],
                     (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
+                    (root, _) => super::host::guard(root, 1, 0)
+                        .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, u.slot))),
                 };
             }
             let out = host

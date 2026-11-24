@@ -183,13 +183,25 @@ fn check_shader(
         }
     }
     let (root, pso) = host.compute_pipeline(&shader).expect("create memory PSO");
-    let mut roots = vec![(
-        0,
-        Root::Constants(vec![0; shader.user_data_dwords() as usize]),
-    )];
-    roots.extend(root_view.map(|view| (1, view)));
     let mut views = vec![View::RawUav(512 + expected.len() as u32)];
     views.extend(extra_view);
+    let root_bytes = match &root_view {
+        Some(Root::View { data, .. }) => (data.len() * 4) as u32,
+        Some(Root::Uav(dwords)) => dwords * 4,
+        _ => 0,
+    };
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match u.root {
+            RootType::Descriptor => root_bytes,
+            RootType::ResourceHeap | RootType::SamplerHeap => {
+                super::host::guard(u.root, views.len(), 0).unwrap()
+            }
+            _ => 0,
+        };
+    }
+    let mut roots = vec![(0, Root::Constants(ud))];
+    roots.extend(root_view.map(|view| (1, view)));
     let out = host
         .dispatch(
             &root,

@@ -6198,7 +6198,7 @@ impl<'a> Lower<'a> {
             );
             let x = self.s.m.extract(c, r, 0);
             let x = self.as_int(x);
-            let x = self.zero_unless(in_bounds, x);
+            let x = self.zero_unless(Some(in_bounds), x);
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -10998,7 +10998,7 @@ impl<'a> Lower<'a> {
                     if index.is_none() {
                         self.in_root_view(size, off, width / 8).0
                     } else {
-                        self.s.m.i1(true)
+                        self.s.m.bool(true)
                     }
                 } else {
                     self.buffer_bounds(h, index, off, stride, width / 8)
@@ -11073,7 +11073,8 @@ impl<'a> Lower<'a> {
             if wide {
                 self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_HEAP;
             }
-            let bounded_guard = self.narrow(self.and_guard(guard, in_bounds), root_ok);
+            let g = self.and_guard(guard, in_bounds);
+            let bounded_guard = self.narrow(g, root_ok);
             let active = if (wide || matches!(op, "sub" | "inc" | "dec" | "csub"))
                 && !matches!(src, Source::Built { .. })
             {
@@ -11175,7 +11176,8 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let store_guard = self.narrow(self.and_guard(guard, in_bounds), root_ok);
+            let g = self.and_guard(guard, in_bounds);
+            let store_guard = self.narrow(g, root_ok);
             let at = self.begin_guarded(store_guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);

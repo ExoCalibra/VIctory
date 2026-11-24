@@ -784,6 +784,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            address_srvs: Vec::new(),
             root_indexed_views: Vec::new(),
         };
         assert_eq!(shader.directly_indexed_heaps(), (false, false));
@@ -1287,8 +1288,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
-            root_indexed_views: Vec::new(),
             address_srvs: Vec::new(),
+            root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -2266,6 +2267,7 @@ mod barycentric_tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                address_srvs: l.address_srvs,
                 root_indexed_views: res.root_indexed_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2275,12 +2277,18 @@ mod barycentric_tests {
             .into_iter()
             .map(f32::to_bits)
             .collect();
+            let mut ud = vec![0u32; cs.user_data_dwords().max(1) as usize];
+            for u in &cs.user_data {
+                if let Some(g) = super::host::guard(u.root, 2, 0) {
+                    ud[u.index as usize] = g;
+                }
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &super::host::Dispatch {
-                        roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                        roots: vec![(0, super::host::Root::Constants(ud))],
                         views: &[
                             super::host::View::Buffer {
                                 data: &inputs,

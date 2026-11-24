@@ -85,13 +85,17 @@ fn valu_program(body: &[u32]) -> NativeProgram {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
-    lower_cs(&words)
+    valu_native(&words)
 }
 
 /// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
 fn lower_cs(words: &[u32]) -> HostShader {
+    lower_test_shader(&valu_native(words), &[])
+}
+
+fn valu_native(words: &[u32]) -> NativeProgram {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     NativeProgram {
         stage: HwStage::Cs,
@@ -282,12 +286,18 @@ fn scalar_buffer_load_uses_byte_offsets_with_a_raw_host_view() {
         .or_else(|_| Host::new(true))
         .expect("SM 6.6 device");
     let (root, pipeline) = host.compute_pipeline(&shader).unwrap();
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        if let Some(g) = super::host::guard(u.root, 2, 0) {
+            ud[u.index as usize] = g;
+        }
+    }
     let out = host
         .dispatch(
             &root,
             &pipeline,
             &Dispatch {
-                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                roots: vec![(0, Root::Constants(ud))],
                 views: &[
                     View::Buffer {
                         data: &data,
@@ -1434,6 +1444,7 @@ fn build_custom_cs(threads: u32, use_lds: bool, loop_limit: u32, body: &[u32]) -
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        address_srvs: lowered.address_srvs,
         root_indexed_views: res.root_indexed_views,
     };
     validate_dxil(&shader.dxil);
@@ -1535,6 +1546,7 @@ fn fullscreen_vs() -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        address_srvs: Vec::new(),
         root_indexed_views: Vec::new(),
     }
 }
@@ -1646,6 +1658,7 @@ fn s_wqm_pixel_loop_and_skip_run_per_quad() {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        address_srvs: Vec::new(),
         root_indexed_views: Vec::new(),
     };
     let vs = fullscreen_vs();
@@ -1741,7 +1754,8 @@ fn oob_lds_reads_writes_and_atomics_clamp_and_drop() {
             ud[u.index as usize] = match (u.root, u.slot) {
                 (RootType::Constants, 0) => inputs[u.dword as usize],
                 (RootType::Table, 1) => 0,
-                other => panic!("unexpected {other:?}"),
+                (root, _) => super::host::guard(root, 1, 0)
+                    .unwrap_or_else(|| panic!("unexpected {:?}", (root, u.slot))),
             };
         }
         let out = host
@@ -2252,6 +2266,7 @@ fn root_uav_graphics_stages_validate_and_build_pso() {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: slots.to_vec(),
+            address_srvs: Vec::new(),
             root_indexed_views: Vec::new(),
         }
     };
@@ -2373,7 +2388,8 @@ fn dispatch_wave32(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
+                    (root, _) => super::host::guard(root, 1, 0)
+                        .unwrap_or_else(|| panic!("unexpected user data {:?}", (root, u.slot))),
                 };
             }
             let out = host

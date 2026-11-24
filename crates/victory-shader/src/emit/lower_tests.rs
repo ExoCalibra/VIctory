@@ -1472,6 +1472,7 @@
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
+            psv: None,
             native: &native,
             p: &p,
             st: &st,
@@ -1481,7 +1482,9 @@
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            target: Target::ANY,
             console_cf: false,
+            per_lane_only: false,
         })
         .map(|l| (l.address_srvs, l.root_srvs))
     }
