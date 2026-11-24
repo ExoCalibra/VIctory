@@ -387,11 +387,19 @@ impl<'a> Tracer<'a> {
     }
 
     /// Layout index and dword of the root parameter `reg` holds on entry.
+    /// The SGPR `p`'s first dword arrives in. Counted wider than a register
+    /// number: `user_data` is a byte of the title's root layout, and on a
+    /// merged stage (user data from s8) one past 247 would wrap round onto
+    /// s0-s7 and claim the registers the hardware fills there. Past s105 a
+    /// parameter then matches no register.
+    fn first_sgpr(&self, p: &RootParam) -> u32 {
+        u32::from(self.stage.user_sgpr(0)) + u32::from(p.user_data)
+    }
+
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
         self.layout.iter().enumerate().find_map(|(i, p)| {
-            let first = self.stage.user_sgpr(p.user_data);
-            let dword = u32::from(code).checked_sub(first.into())?;
+            let dword = u32::from(code).checked_sub(self.first_sgpr(p))?;
             (dword < p.sgprs).then_some((i, dword))
         })
     }
@@ -632,8 +640,9 @@ impl<'a> Tracer<'a> {
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
+                let high = u8::try_from(self.first_sgpr(&self.layout[param]) + 1)
+                    .map_err(|_| "a root descriptor without its high half")?;
+                let input = self.p.inputs.iter().find(|i| i.0 == Reg::S(high));
                 Some(input.ok_or("a root descriptor without its high half")?.1)
             }
             _ => return Err("an address from a root parameter that is no address"),
@@ -2023,6 +2032,47 @@ pub(crate) mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    /// A merged stage's user data starts at s8. A root layout byte past 247
+    /// used to wrap round onto s0-s7 (a panic in a debug build), so the load
+    /// below through s[2:3] was taken for a table at user data 250.
+    #[test]
+    fn user_data_past_the_sgprs_names_no_register() {
+        let code: Vec<u8> = [0xF408_0001, 0xFA00_0000, S_ENDPGM] // s_load_dwordx4 s[0:3], s[2:3]
+            .iter()
+            .flat_map(|w: &u32| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        for stage in [
+            HwStage::Ls,
+            HwStage::Hs,
+            HwStage::Es,
+            HwStage::Gs,
+            HwStage::Ms,
+        ] {
+            for user_data in [250, 255] {
+                let err = track(&p, &[param(Table, user_data, 1)], stage).unwrap_err();
+                assert_eq!(
+                    err,
+                    ShaderError::Unsupported {
+                        offset: 0,
+                        what: "an address in an SGPR that is no root parameter"
+                    },
+                    "{stage:?} at user data {user_data}"
+                );
+            }
+        }
+        // Wrapped, 250 + 8 named s2 and the load was claimed for the table
+        // (failing later, on its high half); user data at s2 still is.
+        let err = track(&p, &[param(Table, 2, 1)], HwStage::Ps).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0,
+                what: "an address with an untracked high half"
+            }
         );
     }
 }
