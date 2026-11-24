@@ -273,6 +273,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, w);
         }
     }
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -361,6 +362,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             props: (r.word()?, r.word()?),
         });
     }
+    let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -373,6 +375,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_indexed_views,
         address_srvs,
         table_views,
+        stride_table,
     })
 }
 
@@ -433,6 +436,7 @@ mod tests {
                     props: (12 | 0x1000, 32),
                 },
             ],
+            stride_table: true,
         }
     }
 
