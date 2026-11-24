@@ -7659,16 +7659,17 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name) = if typed {
-                // shortcut: typed stores are taken to write all four channels
-                // of a float format.
-                if count != 4 || *offen || *offset != 0 {
-                    return Err("a typed buffer store of some channels or at an offset");
+                // shortcut: typed stores are taken to write channels of a float
+                // format.
+                if *offen || *offset != 0 {
+                    return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
                     args.push(self.as_float(x));
                 }
+                args.resize(3 + 4, self.s.m.undef(self.s.t.f32));
                 (69, "bufferStore.f32")
             } else {
                 match index {
@@ -7689,7 +7690,7 @@ impl<'a> Lower<'a> {
                 args.resize(3 + 4, iu);
                 (140, "rawBufferStore.i32")
             };
-            args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
+            args.push(self.s.m.i8((1u8 << count) - 1));
             if !typed {
                 args.push(self.s.m.i32(4));
             }
@@ -9170,12 +9171,6 @@ mod tests {
         })
         .unwrap();
 
-        // DXIL resource properties: word 0 is the kind (Texture2D = 2) with
-        // the UAV bit (0x1000); word 1 is the component type in the low byte
-        // (U32 = 5, F32 = 9, DxilConstants.h `ComponentType`) and the
-        // component count above it. D3D12 allows atomics (Interlocked*) on
-        // integer UAVs only, so the atomic needs its own one-U32 annotation
-        // next to the load's four-float one.
         const TEXTURE_2D_UAV: u32 = 0x1002;
         assert!(
             lowered.annotations.contains(&(TEXTURE_2D_UAV, 0x409)),
@@ -9217,9 +9212,6 @@ mod tests {
             pack2,
             row2,
         };
-        // Row 0 has row2 == row (0) and pairs with unlisted row 1;
-        // row 2 explicitly names row2 == 4 (not stolen by row 0);
-        // row 5 has row2 == row (5) and no remaining unlisted row after it.
         let inputs = vec![
             sig(0, true),
             sig(1, true),
@@ -9243,9 +9235,6 @@ mod tests {
         assert_eq!(map.get(&2), Some(&(true, Some(4))));
         assert_eq!(map.get(&5), Some(&(true, None)));
 
-        // Duplicate entries for the same row keep the first entry and do not
-        // consume an extra free row; an earlier unpaired row (0) must not steal
-        // a free row (3) that comes after a later fp16 row (2).
         let inputs2 = vec![sig(0, true), sig(2, true), sig(3, true)];
         let io2 = StageIo::Ps {
             inputs: vec![
@@ -9305,7 +9294,7 @@ mod tests {
             let res = resource::track(&p, &native.layout, native.stage).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
-            let out = lower(&Parts {
+            lower(&Parts {
                 psv: None,
                 native: &native,
                 p: &p,
@@ -9316,8 +9305,8 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
-            });
-            out.unwrap();
+            })
+            .unwrap();
         }
     }
 
@@ -9339,6 +9328,64 @@ mod tests {
                 0x0001_0000,
                 0x7D9A_0080,
                 0xBF81_0000,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 4).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                psv: None,
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn partial_channel_typed_buffer_store_lowers() {
+        use crate::native::{RootParam, RootType};
+
+        for op in [0x04u32, 0x05, 0x06, 0x86] {
+            let mubuf_w0 = 0xE000_2000 | (op << 18);
+            let words = [
+                0xBE81_0380u32,
+                0xF408_0100,
+                0xFA00_0000,
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0280,
+                0x7E06_0280,
+                mubuf_w0,
+                0x8001_0100,
+                S_ENDPGM,
             ];
             let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             let native = NativeProgram {
@@ -9449,10 +9496,6 @@ mod select_tests {
             let features = emitted.part(FourCC::SFI0).unwrap();
             let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;
             assert_eq!(wave_ops, uses_select);
-=======
-            })
-            .unwrap();
->>>>>>> 6d7602d (Shaders: lower MSAA image_load and image_get_resinfo)
         }
     }
 }
