@@ -248,6 +248,14 @@ fn emit_uav_barrier(list: &HostList) {
     unsafe { list.list.ResourceBarrier(&[barrier]) };
 }
 
+/// The bytes of title memory at `address` a root view binds (and shaders
+/// may read: see [`State::root_view_bytes`]).
+fn root_view_len(shadow: &crate::shadow::Shadow, address: u64, srv: bool) -> u64 {
+    shadow
+        .left(address)
+        .min(if srv { 1 << 20 } else { 1 << 16 })
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -516,6 +524,25 @@ impl State {
             .is_some_and(|(host, index)| index >= host.count())
     }
 
+    /// The bytes root view `slot` holds from its start, as [`root_view`]
+    /// binds it. Shaders check their accesses against it: a root view has
+    /// no bounds on the host, and an access past the memory it maps is a
+    /// GPU page fault, which some hosts stall on until the driver resets
+    /// the device. 0 for a root view the title did not set or outside mapped
+    /// title memory.
+    fn root_view_bytes(&self, compute: bool, slot: u8, kind: RootView) -> u32 {
+        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        if address == 0 {
+            return 0;
+        }
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            return 0;
+        };
+        u32::try_from(root_len(shadow.left(address), kind)).unwrap_or(u32::MAX)
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -732,6 +759,16 @@ impl State {
                                 "a draw or dispatch dropped: its table lies past the host heap"
                             );
                             return false;
+                        }
+                        None if u.root == RootType::Descriptor => {
+                            let kind = if stage.root_uavs.iter().any(|r| r.0 == u.slot) {
+                                RootView::Uav
+                            } else if stage.root_srvs.iter().any(|r| r.0 == u.slot) {
+                                RootView::Srv
+                            } else {
+                                RootView::Cbv
+                            };
+                            self.root_view_bytes(compute, u.slot, kind)
                         }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
