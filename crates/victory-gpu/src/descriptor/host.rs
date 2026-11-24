@@ -36,6 +36,16 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>)>,
 }
 
+impl Drop for HostHeap {
+    fn drop(&mut self) {
+        if let Ok(mut kept) = self.kept.lock() {
+            for res in kept.drain(..).flatten() {
+                crate::host::retire(res);
+            }
+        }
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -361,6 +371,57 @@ impl HostHeap {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
+        }
+        self.keep(index, None);
+    }
+
+    /// Writes a typed null descriptor into slot `index` matching the resource
+    /// kind the shader expects (CBV, buffer/texture SRV, or buffer/texture UAV),
+    /// rather than a generic 2D SRV (#135).
+    pub(crate) fn make_null_kind(
+        &self,
+        index: u32,
+        kind: victory_shader::ResourceType,
+        dwords: u8,
+    ) {
+        if self.sampler {
+            self.null_sampler(index);
+            self.keep(index, None);
+            return;
+        }
+        let at = self.cpu(index);
+        match kind {
+            victory_shader::ResourceType::Cbv => {
+                if let Some(host) = host() {
+                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                    // SAFETY: a slot of our heap; zero location makes a null CBV.
+                    unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+                }
+            }
+            victory_shader::ResourceType::Srv if dwords == 4 => null_buffer_view(at),
+            victory_shader::ResourceType::Uav => {
+                if let Some(host) = host() {
+                    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_UINT,
+                        ViewDimension: if dwords == 4 {
+                            D3D12_UAV_DIMENSION_BUFFER
+                        } else {
+                            D3D12_UAV_DIMENSION_TEXTURE2D
+                        },
+                        ..Default::default()
+                    };
+                    // SAFETY: a slot of our heap; null resource makes a null UAV.
+                    unsafe {
+                        host.device.CreateUnorderedAccessView(
+                            None::<&ID3D12Resource>,
+                            None::<&ID3D12Resource>,
+                            Some(&desc),
+                            at,
+                        )
+                    };
+                }
+            }
+            _ => null_view(at),
         }
         self.keep(index, None);
     }

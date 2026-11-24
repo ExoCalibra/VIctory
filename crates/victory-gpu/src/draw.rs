@@ -526,11 +526,17 @@ impl State {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                        once!(slot, srv, "a shader reads a root view the title did not set");
+                        return false;
                     };
                     let Some(gpu) = root_view(list, *address, srv) else {
-                        continue;
+                        once!(
+                            slot,
+                            srv,
+                            address = format_args!("{address:#x}"),
+                            "a shader reads a root view outside title buffers"
+                        );
+                        return false;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -775,7 +781,7 @@ impl State {
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                            host.make_null_kind(index, ResourceType::Cbv, 4);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
@@ -788,9 +794,11 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
-                        if used.is_some() {
+                        if let Some(u) = used {
+                            host.make_null_kind(index, u.kind, u.dwords);
                             once!(slot, "a table entry without a view");
+                        } else {
+                            host.make_null(index);
                         }
                     }
                 }

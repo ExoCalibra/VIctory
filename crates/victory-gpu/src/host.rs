@@ -1180,7 +1180,7 @@ mod tests {
         }
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        let rtv = host.rtv(&target, None);
+        let rtv = host.rtv(Some(&target), None);
         // SAFETY: one draw argument, no root arguments.
         let signature: ID3D12CommandSignature = unsafe {
             let argument = D3D12_INDIRECT_ARGUMENT_DESC {
@@ -1241,11 +1241,17 @@ mod tests {
             // SAFETY: an open list with the draw state set.
             unsafe { list.list.DrawInstanced(3, 1, 0, 0) };
         };
-        // As `draw.rs` executes indirect draws: clamp, bind, execute.
+        // As `draw.rs` executes indirect draws: clamp, bind, execute, done.
         let indirect = |list: &HostList| {
-            assert!(crate::indirect::bound(list, &buffer, gpu + 256, (0, 16, 1)));
+            let bounded = crate::indirect::bound(list, (&buffer, 256), None, (0, 16, 1))
+                .expect("indirect::bound");
             bind(list);
-            crate::indirect::execute(list, &signature, 1, (&buffer, 256), None);
+            // SAFETY: open list with draw state set and clamped scratch ready.
+            unsafe {
+                list.list
+                    .ExecuteIndirect(&signature, 1, &bounded.scratch, 0, None, 0)
+            };
+            crate::indirect::done(list, &bounded);
         };
         // A list that draws, draws indirectly, draws; then one that starts
         // with an indirect draw, submitted together.
@@ -2290,6 +2296,7 @@ impl HostList {
     ///
     /// shortcut: only writes declared through [`Self::defer_gpu_write`] are
     /// seen; a buffer-state tracker should replace this.
+    #[cfg(test)]
     pub(crate) fn gpu_written(&self, buffer: &ID3D12Resource) -> bool {
         use windows::core::Interface;
         self.deferred().copies.iter().any(|step| {

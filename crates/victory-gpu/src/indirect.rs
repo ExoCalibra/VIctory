@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{BUFFER_READ, BUFFER_WRITE, HostList, host};
+use crate::host::{BUFFER_READ, HostList, host, transition};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -241,9 +241,9 @@ pub(crate) fn bound(
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     // Title buffers are managed by `HostList::buffer_state` (#334); move both
     // to `BUFFER_READ` here so `record_clamp` only transitions its own scratch.
-    list.buffer_state(src.0, crate::host::BUFFER_READ);
+    list.buffer_state(src.0, BUFFER_READ);
     if let Some((buf, _)) = count {
-        list.buffer_state(buf, crate::host::BUFFER_READ);
+        list.buffer_state(buf, BUFFER_READ);
     }
     record_clamp(c, &list.list, &dst, budget, src, count, spec, &[]).then_some(Bounded {
         scratch: dst,
@@ -268,6 +268,7 @@ const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
 /// The distinct buffers among `src` and `count` that `written` (shaders of
 /// the list wrote them through unordered access) names; once each, as the
 /// count may be in the argument buffer.
+#[cfg(test)]
 fn written_among(
     src: &ID3D12Resource,
     count: Option<&ID3D12Resource>,
