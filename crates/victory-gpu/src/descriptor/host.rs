@@ -1594,7 +1594,7 @@ fn buffer_srv(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
-    let element = element_size(&desc);
+    let mut element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
@@ -1621,6 +1621,7 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        element = 4;
     } else {
         once!(
             offset,
@@ -1633,6 +1634,19 @@ fn buffer_srv(
         let first = buffer.FirstElement;
         once!(first, "raw buffer view not on 16 bytes of its host copy");
         return None;
+    }
+    // A view past its host copy's end is an invalid call (the debug layer
+    // removes the device; drivers may fault): none past the end, the rest
+    // cut to fit.
+    // SAFETY: a live buffer.
+    let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
+    if buffer.FirstElement >= capacity {
+        let first = buffer.FirstElement;
+        once!(first, capacity, "buffer view past the end of its host copy");
+        return None;
+    }
+    if buffer.FirstElement.saturating_add(u64::from(buffer.NumElements)) > capacity {
+        buffer.NumElements = (capacity - buffer.FirstElement) as u32;
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -1661,7 +1675,7 @@ fn buffer_uav(
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
-    let element = if buffer.StructureByteStride > 0 {
+    let mut element = if buffer.StructureByteStride > 0 {
         u64::from(buffer.StructureByteStride)
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
@@ -1693,6 +1707,7 @@ fn buffer_uav(
             Flags: D3D12_BUFFER_UAV_FLAG_RAW,
         };
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        element = 4;
     } else {
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
@@ -1704,6 +1719,19 @@ fn buffer_uav(
             "raw unordered buffer view not on 16 bytes of its host copy"
         );
         return None;
+    }
+    // A view past its host copy's end is an invalid call (the debug layer
+    // removes the device; drivers may fault): none past the end, the rest
+    // cut to fit.
+    // SAFETY: a live buffer.
+    let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
+    if buffer.FirstElement >= capacity {
+        let first = buffer.FirstElement;
+        once!(first, capacity, "buffer view past the end of its host copy");
+        return None;
+    }
+    if buffer.FirstElement.saturating_add(u64::from(buffer.NumElements)) > capacity {
+        buffer.NumElements = (capacity - buffer.FirstElement) as u32;
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
