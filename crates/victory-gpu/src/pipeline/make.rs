@@ -339,6 +339,10 @@ fn queue(p: Arc<Pending>) {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                // NVIDIA's DXIL compiler (nvgpucomp64.dll) recurses deeply on large
+                // world shaders and overflows Windows's default 1-2 MiB thread stack
+                // (STATUS_STACK_OVERFLOW / 0xc00000fd).
+                .stack_size(64 << 20)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
