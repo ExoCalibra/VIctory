@@ -608,6 +608,11 @@ struct Lower<'a> {
     no_barrier: HashSet<usize>,
     /// Whether any reachable block contains an active `s_barrier`.
     any_active_barrier: bool,
+    /// IR blocks whose `s_barrier` is control-dependent on a non-uniform
+    /// (per-lane) branch: emitting `SYNC_THREAD_GROUP` (bit 0) there
+    /// deadlocks 32-lane hosts when warps diverge, so only the memory fence
+    /// bits are emitted.
+    fence_only_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1408,6 +1413,11 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let fence_only_barrier = if x.console_cf {
+            HashSet::new()
+        } else {
+            divergent_barriers(p, x.st, &no_barrier)
+        };
         Lower {
             s,
             x,
@@ -1481,6 +1491,7 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             any_active_barrier: false,
+            fence_only_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             half_inputs: half_inputs(&x.native.io, &x.inputs),
             mask_data: match x.native.stage {
@@ -4100,18 +4111,28 @@ impl<'a> Lower<'a> {
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
         let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
-        self.end_guarded(at, &[]);
+        let passes = mesh.max_primitives.div_ceil(threads.max(1));
+        for pass in 0..passes {
+            let idx = if pass == 0 {
+                flat
+            } else {
+                let off = self.s.m.i32(pass * threads);
+                self.s.m.bin(self.cur, Bin::Add, flat, off)
+            };
+            let need_guard = (pass + 1) * threads > mesh.max_primitives;
+            let guard = need_guard.then(|| self.s.m.cmp(self.cur, pred::IULT, idx, p));
+            let at = self.begin_guarded(guard);
+            self.s.op(
+                self.cur,
+                "emitIndices",
+                Attr::NoUnwind,
+                void,
+                169,
+                &[idx, z, z, z],
+            );
+            self.end_guarded(at, &[]);
+        }
         Ok(())
     }
 
@@ -4797,7 +4818,15 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                // Omit SYNC_THREAD_GROUP (1) when control-dependent on a
+                // per-lane branch, where a 32-lane host deadlocks if one
+                // warp skips the barrier while another waits on it.
+                let sync = if self.fence_only_barrier.contains(&b) {
+                    0
+                } else {
+                    1
+                };
+                let mode = sync | 8 | if self.writes_uavs { 2 } else { 0 };
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -11010,7 +11039,8 @@ impl<'a> Lower<'a> {
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// indices 0: no area); any vertex index at or past `max_vertices` is
+    /// also culled so out-of-range indices never fault the host rasterizer.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -12147,6 +12177,91 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
         Barycentric::LinearSample => 7,
         Barycentric::PerspectivePullModel => return None,
     })
+}
+
+/// IR blocks containing `s_barrier` (not already in `skip`) that are
+/// control-dependent on a non-uniform (per-lane) branch: one path from a
+/// divergent branch can reach the barrier while the other can reach an exit
+/// without passing through it. Emitting `SYNC_THREAD_GROUP` in such a block
+/// deadlocks 32-lane hosts whenever warps diverge.
+fn divergent_barriers(
+    p: &crate::ir::Program,
+    st: &crate::structure::Structured,
+    skip: &HashSet<usize>,
+) -> HashSet<usize> {
+    let n = p.blocks.len();
+    let barriers: Vec<usize> = (0..n)
+        .filter(|b| {
+            !skip.contains(b)
+                && p.blocks[*b]
+                    .insts
+                    .iter()
+                    .any(|i| i.name() == "s_barrier")
+        })
+        .collect();
+    if barriers.is_empty() {
+        return HashSet::new();
+    }
+    let divergent: Vec<(usize, usize)> = (0..n)
+        .filter_map(|u| match st.exits[u] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } if taken != not_taken
+                && st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .any(|a| !matches!(a, Atom::Uniform(_))) =>
+            {
+                Some((taken, not_taken))
+            }
+            _ => None,
+        })
+        .collect();
+    if divergent.is_empty() {
+        return HashSet::new();
+    }
+    let ends: Vec<usize> = (0..n)
+        .filter(|&b| matches!(st.exits[b], LaneExit::End))
+        .collect();
+    let mut out = HashSet::new();
+    for b in barriers {
+        let mut can_reach = vec![false; n];
+        let mut stack = vec![b];
+        can_reach[b] = true;
+        while let Some(cur) = stack.pop() {
+            for &pred in &p.blocks[cur].preds {
+                if !can_reach[pred] {
+                    can_reach[pred] = true;
+                    stack.push(pred);
+                }
+            }
+        }
+        let mut can_bypass = vec![false; n];
+        for &e in &ends {
+            if e != b && !can_bypass[e] {
+                can_bypass[e] = true;
+                stack.push(e);
+            }
+        }
+        while let Some(cur) = stack.pop() {
+            for &pred in &p.blocks[cur].preds {
+                if pred != b && !can_bypass[pred] {
+                    can_bypass[pred] = true;
+                    stack.push(pred);
+                }
+            }
+        }
+        if divergent
+            .iter()
+            .any(|&(t, f)| (can_reach[t] && can_bypass[f]) || (can_reach[f] && can_bypass[t]))
+        {
+            out.insert(b);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
