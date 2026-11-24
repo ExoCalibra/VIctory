@@ -1306,6 +1306,9 @@ impl State {
                 )
             };
             prepared.after_draw(list);
+            if p.has_root_uavs() {
+                emit_uav_barrier(list);
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }

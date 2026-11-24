@@ -570,7 +570,7 @@ impl Prepared {
     /// optional count buffer for `ExecuteIndirect`, and binds the expanded
     /// per-vertex buffer views (overriding the title's slots after `prepare`).
     pub(crate) fn before_draw(&self, list: &HostList) {
-        let mut barriers = Vec::with_capacity(3);
+        let mut barriers = Vec::with_capacity(2);
         barriers.push(transition(
             &self.args_buf,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -584,11 +584,7 @@ impl Prepared {
             ));
         }
         if let Some(counter) = &self.counter {
-            barriers.push(transition(
-                counter,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ));
+            list.buffer_state(counter, crate::host::BUFFER_READ);
         }
         // SAFETY: an open list and live buffers owned by the list or shadows.
         unsafe {
@@ -599,10 +595,11 @@ impl Prepared {
         }
     }
 
-    /// Restores the scratch buffers and optional count buffer to unordered
-    /// access so subsequent passes and draws can reuse them.
+    /// Restores the scratch buffers to unordered access so subsequent passes
+    /// and draws can reuse them (the optional count buffer stays tracked by
+    /// `HostList::buffer_state`).
     pub(crate) fn after_draw(&self, list: &HostList) {
-        let mut barriers = Vec::with_capacity(3);
+        let mut barriers = Vec::with_capacity(2);
         barriers.push(transition(
             &self.args_buf,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
@@ -615,14 +612,7 @@ impl Prepared {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             ));
         }
-        if let Some(counter) = &self.counter {
-            barriers.push(transition(
-                counter,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            ));
-        }
-        // SAFETY: an open list and live buffers owned by the list or shadows.
+        // SAFETY: an open list and live buffers owned by the list.
         unsafe { list.list.ResourceBarrier(&barriers) };
     }
 }
@@ -745,13 +735,20 @@ pub(crate) fn expand(
         w.shadow.refresh(list, w.address, u64::from(w.size));
     }
 
-    let src_args_gpu = args.gpu(arguments);
-    if !crate::indirect::clamp_uav(list, src_args_gpu, (0, stride, max)) {
+    let Some(clamped) = crate::indirect::clamp_uav(
+        list,
+        (&args.buffer, args.offset(arguments)),
+        counter.map(|(c, at)| (&c.buffer, c.offset(at))),
+        (0, stride, max),
+    ) else {
         return Err("rectangle clamp unavailable");
-    }
-
-    // SAFETY: live D3D12 resources.
+    };
+    // SAFETY: live D3D12 resources (`clamped` is in `UNORDERED_ACCESS`).
+    let src_args_gpu = unsafe { clamped.GetGPUVirtualAddress() };
     let dst_args_gpu = unsafe { dst_args_buf.GetGPUVirtualAddress() };
+    if let Some((c, _)) = counter {
+        list.buffer_state(&c.buffer, crate::host::BUFFER_WRITE);
+    }
     let count_gpu = counter.map_or(src_args_gpu, |(c, at)| c.gpu(at));
     let rewrite_consts = [
         max,
@@ -778,6 +775,9 @@ pub(crate) fn expand(
 
     let mut views = Vec::with_capacity(work.len());
     if let Some(vb) = &vert_buf {
+        for w in &work {
+            list.buffer_state(&w.shadow.buffer, crate::host::BUFFER_WRITE);
+        }
         // SAFETY: live buffer.
         let dst_vb_base = unsafe { vb.GetGPUVirtualAddress() };
         let (grid_x, grid_y) = dispatch_grid(max);
@@ -819,6 +819,15 @@ pub(crate) fn expand(
                 ));
             }
         }
+    }
+    // Return `indirect_scratch` (`clamped`) to `COMMON` for the next indirect call.
+    // SAFETY: an open list and live `clamped` currently in `UNORDERED_ACCESS`.
+    unsafe {
+        l.ResourceBarrier(&[transition(
+            &clamped,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )]);
     }
 
     Ok(Prepared {
