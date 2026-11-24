@@ -706,6 +706,9 @@ extern "system" fn copy_texture_region(
             if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
                 return;
             }
+            if crate::texture::title_written(texture) {
+                crate::texture::upload(list, src.resource, texture);
+            }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
