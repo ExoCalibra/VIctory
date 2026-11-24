@@ -6,7 +6,8 @@
 //! on the GPU into a device-local scratch buffer, just before execution, by a
 //! compute shader of ours (HLSL compiled by the system's compiler; a 5.1
 //! shader with its root signature inside), leaving the title's argument and
-//! count buffers untouched.
+//! count buffers untouched. Non-indexed rectangle-list draws follow the clamp
+//! with GPU-side rectangle expansion in [`crate::rectangles`].
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
@@ -222,30 +223,50 @@ fn validate_layout(
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
+/// buffer, leaving that scratch buffer in `UNORDERED_ACCESS` at offset `0`
+/// with a UAV barrier after the write (for passes such as [`crate::rectangles`]
+/// that read the clamped records in another compute shader; the caller must
+/// transition the returned scratch back to `COMMON` when done). Replaces the
+/// list's compute root signature and pipeline (callers bind theirs after).
+pub(crate) fn clamp_uav(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+) -> Option<ID3D12Resource> {
+    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    // Title buffers are managed by `HostList::buffer_state` (#334); move both
+    // to `BUFFER_READ` here so `record_clamp_uav` only transitions its own scratch.
+    list.buffer_state(src.0, BUFFER_READ);
+    if let Some((buf, _)) = count {
+        list.buffer_state(buf, BUFFER_READ);
+    }
+    record_clamp_uav(c, &list.list, &dst, budget, src, count, spec, &[]).then_some(dst)
+}
+
+/// Records, in `list`, the non-destructive clamp of up to `records` records of
+/// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
+/// by the 32-bit count in `count` when given) into a device-local scratch
 /// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp or alignment is not available.
-///
-/// The argument and count buffers are read in place (root SRVs, and the
-/// count by `ExecuteIndirect`). One the list's shaders already wrote is in
-/// `UNORDERED_ACCESS`, from which a buffer cannot be promoted, so it moves
-/// to [`READ`] here and back in [`done`]; the others are promoted from
-/// `COMMON`.
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<Bounded> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    // Title buffers are managed by `HostList::buffer_state` (#334); move both
-    // to `BUFFER_READ` here so `record_clamp` only transitions its own scratch.
-    list.buffer_state(src.0, BUFFER_READ);
-    if let Some((buf, _)) = count {
-        list.buffer_state(buf, BUFFER_READ);
+    let dst = clamp_uav(list, src, count, spec)?;
+    // SAFETY: an open list and a live scratch buffer currently in `UNORDERED_ACCESS`.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            &dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
-    record_clamp(c, &list.list, &dst, budget, src, count, spec, &[]).then_some(Bounded {
+    Some(Bounded {
         scratch: dst,
         written: Vec::new(),
     })
@@ -284,8 +305,34 @@ fn written_among(
     out
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_clamp(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    written: &[ID3D12Resource],
+) -> bool {
+    if !record_clamp_uav(c, l, dst, budget, src, count, spec, written) {
+        return false;
+    }
+    // SAFETY: an open list and live `dst` in `UNORDERED_ACCESS`.
+    unsafe {
+        l.ResourceBarrier(&[transition(
+            dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_uav(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
@@ -369,14 +416,7 @@ fn record_clamp(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                dst,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.ResourceBarrier(&[uav_barrier()]);
     }
     true
 }
@@ -404,7 +444,7 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource, written: 
     unsafe { list.ResourceBarrier(&after) };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
