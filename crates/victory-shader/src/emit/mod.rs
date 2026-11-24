@@ -857,7 +857,7 @@ mod tests {
                 used: vec![],
                 io: StageIo::Ps {
                     inputs: vec![],
-                    input_addr: 2,
+                    input_addr: 8,
                     db_shader_control: 0,
                     patches: vec![],
                 },
@@ -890,7 +890,7 @@ mod tests {
                     matches!(
                         shader,
                         Err(ShaderError::Unsupported {
-                            what: "barycentrics read directly",
+                            what: "pull-model barycentrics",
                             ..
                         })
                     ),

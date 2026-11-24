@@ -8324,7 +8324,19 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                let overwritten = !bit
+                    && self.read_phis.contains(&phi.value)
+                    && self.overwritten_movreld_edge(b, phi, n).is_some();
+                let is_bary = self
+                    .x
+                    .io
+                    .inputs
+                    .iter()
+                    .any(|&(w, i)| w == arg && matches!(i, Input::Barycentric { .. }));
+                if self.read_phis.contains(&phi.value)
+                    && !self.vals.contains_key(&arg)
+                    && !(overwritten && is_bary)
+                {
                     let _ = self.lazy_barycentric(arg);
                 }
                 let x = match (self.vals.get(&arg).copied(), bit) {
@@ -8339,12 +8351,8 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.i32(0)
                     }
-                    (Some(Val::Missing("barycentrics read directly")), false)
-                        if self.read_phis.contains(&phi.value)
-                            && self.overwritten_movreld_edge(b, phi, n).is_some() =>
-                    {
-                        self.s.m.undef(self.s.t.i32)
-                    }
+                    (Some(Val::Missing(_)), false) if overwritten => self.s.m.undef(self.s.t.i32),
+                    (None, false) if overwritten && is_bary => self.s.m.undef(self.s.t.i32),
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
@@ -8520,46 +8528,6 @@ mod tests {
         );
     }
 
-    /// Lowers a compute program with the root parameters `layout` (in user
-    /// SGPRs from s0 on) and the used resources `used`.
-    fn lower_with(
-        words: &[u32],
-        layout: Vec<RootParam>,
-        used: Vec<UsedResource>,
-    ) -> Result<Lowered, crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
-        let native = NativeProgram {
-            stage: HwStage::Cs,
-            wave64: false,
-            vgprs: 256,
-            layout,
-            used,
-            io: StageIo::Cs(ComputeIo {
-                // The layout's user SGPRs (at least two), 512 bytes of LDS.
-                rsrc2: 1 << 15 | sgprs.max(2) << 1,
-                threads: [1, 1, 1],
-            }),
-            code,
-        };
-        let p = ir::build(&native.code, false, 256).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage)?;
-        let io = io::raise(&p, &native).unwrap();
-        let st = structure::structure(&p).unwrap();
-        lower(&Parts {
-            psv: None,
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
-            inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
-        })
-    }
-
     /// Lowers a pixel program with one target: whether it translates.
     fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -8645,6 +8613,7 @@ mod tests {
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
+            psv: None,
             native: &native,
             p: &p,
             st: &st,

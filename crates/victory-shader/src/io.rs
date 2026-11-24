@@ -332,7 +332,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
                 // Only interpolation has an attribute as a VALU source.
                 Fields::Valu(v) if matches!(v.src.first(), Some(Operand::Attr { .. })) => {
-                    match name {
+                    match inst.name() {
                         // First halves: `v_interp_p2_f16` pairs with them
                         // below. `v_interp_p1lv_f16`'s P0 comes from a lane
                         // VGPR (`v.src[2]`) instead of the local data share, but
