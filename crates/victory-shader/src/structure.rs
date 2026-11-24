@@ -434,6 +434,9 @@ pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
 fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
+        while let Some(key) = l.console_pending.pop() {
+            l.mask(key);
+        }
         let cond = l.paths()?;
         let (wrong, new_derived) = l.check_joins(&cond);
         if l.b.overflow {
@@ -456,6 +459,7 @@ struct Lanes<'a> {
     p: &'a Program,
     /// See [`structure_console`].
     console: bool,
+    console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -551,6 +555,7 @@ impl<'a> Lanes<'a> {
         Ok(Lanes {
             p,
             console,
+            console_pending: Vec::new(),
             order,
             index,
             incoming,
@@ -573,6 +578,7 @@ impl<'a> Lanes<'a> {
     }
 
     fn reset(&mut self) {
+        self.console_pending.clear();
         self.b = Bools::new();
         self.masks.clear();
         self.other.clear();
@@ -930,6 +936,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.console {
+            self.console_pending.extend(args.iter().copied());
         }
         if self.phi_join_ids.insert(id) {
             self.phi_joins.push(PhiJoin {
