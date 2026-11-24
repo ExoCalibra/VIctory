@@ -43,6 +43,8 @@ struct Global {
     align: u64,
     /// An internal constant with this initialiser (a constant table).
     init: Option<u32>,
+    /// With `init`: written by the program (an HLSL `static` array).
+    mutable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -381,6 +383,7 @@ impl Module {
             space,
             align: 3,
             init: None,
+            mutable: false,
         });
         V::Global(self.globals.len() as u32 - 1)
     }
@@ -388,6 +391,16 @@ impl Module {
     pub fn align_global_to_eight(&mut self, global: V) {
         let V::Global(n) = global else { unreachable!() };
         self.globals[n as usize].align = 4; // log2(alignment) + 1
+    }
+
+    /// An internal global the program writes (per thread, as an HLSL
+    /// `static` array), initialised with the constant `init`.
+    pub fn static_global(&mut self, name: &str, init: V) -> V {
+        let g = self.constant_global(name, init);
+        if let V::Global(n) = g {
+            self.globals[n as usize].mutable = true;
+        }
+        g
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -855,7 +868,7 @@ impl Module {
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
             // section]
             let (constant, init, linkage) = match g.init {
-                Some(i) => (1, first_const + u64::from(i) + 1, 3),
+                Some(i) => (u64::from(!g.mutable), first_const + u64::from(i) + 1, 3),
                 None => (0, 0, 0),
             };
             w.record(
