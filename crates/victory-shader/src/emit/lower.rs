@@ -2825,15 +2825,10 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// An operand read as f16 data: an inline float constant is its f16
-    /// value in both halves (so op_sel picks either), not the f32 bits
-    /// `operand` gives, whose low half is 0.
+    /// GFX10 puts an inline f16 constant in the low half of the operand.
     fn f16_operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
         match *op {
-            Operand::Const(c @ 240..=248) => {
-                let h = inline_f16(c);
-                Ok(self.s.m.i32(h | h << 16))
-            }
+            Operand::Const(c @ 240..=248) => Ok(self.s.m.i32(inline_f16(c))),
             _ => self.operand(inst, op),
         }
     }
@@ -7055,7 +7050,7 @@ impl<'a> Lower<'a> {
                         // VOP3P picks each half with op_sel/op_sel_hi; VOP2
                         // takes the low half for the low product.
                         let h = if packed {
-                            self.packed_src(inst, k, high)?
+                            self.packed_src(inst, k, high, true)?
                         } else {
                             let x = s(self, k)?;
                             let x = if high {
@@ -7704,10 +7699,9 @@ impl<'a> Lower<'a> {
                 _ => return Err("a byte select on a 16-bit operation"),
             }
         }
-        let x = match (op, self.src0) {
-            (_, Some(x)) if k == 0 => x,
-            (Operand::Const(c @ 240..=248), _) => self.s.m.i32(inline_f16(c)),
-            _ => self.operand(inst, &op)?,
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => self.f16_operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if high {
@@ -8112,14 +8106,19 @@ impl<'a> Lower<'a> {
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
     /// 16 bits: op_sel picks the half the low result reads, op_sel_hi the
-    /// half the high result reads. Inline float constants are f16 values.
-    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
+    /// half the high result reads. Packed integer instructions see the f32
+    /// bits of an inline float constant.
+    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool, float: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
-        let x = self.f16_operand(inst, &op)?;
+        let x = if float {
+            self.f16_operand(inst, &op)?
+        } else {
+            self.operand(inst, &op)?
+        };
         let c = self.cur;
         let x = if sel {
             let k16 = self.s.m.i32(16);
@@ -8154,7 +8153,7 @@ impl<'a> Lower<'a> {
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = self.packed_src(inst, k, high)?;
+                let h = self.packed_src(inst, k, high, float)?;
                 if float {
                     let mut f = self
                         .s
