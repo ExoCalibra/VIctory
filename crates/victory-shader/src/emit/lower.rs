@@ -139,6 +139,41 @@ thread_local! {
     pub(crate) static AUDIT_OFFSET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TwinSoffset {
+    Null,
+    Val(Value),
+    FirstLane(Value),
+}
+
+type TwinKey = (&'static str, i32, Value, Value, TwinSoffset);
+
+fn twin_load_key(inst: &Inst, first_lane_src: &HashMap<Value, Value>) -> Option<TwinKey> {
+    let Fields::Smem {
+        base: Operand::Scalar { code: b, .. },
+        offset,
+        soffset,
+        ..
+    } = &inst.fields
+    else {
+        return None;
+    };
+    let lo = inst.read(Reg::S(*b))?;
+    let hi = inst.read(Reg::S(*b + 1))?;
+    let so = match *soffset {
+        Operand::Scalar { code: NULL, .. } => TwinSoffset::Null,
+        Operand::Scalar { code, .. } => {
+            let v = inst.read(Reg::S(code))?;
+            match first_lane_src.get(&v) {
+                Some(&vgpr) => TwinSoffset::FirstLane(vgpr),
+                None => TwinSoffset::Val(v),
+            }
+        }
+        _ => return None,
+    };
+    Some((inst.name(), *offset, lo, hi, so))
+}
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -478,6 +513,18 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
+    /// Precomputed descriptor use site (`(use_site, first)`) by exact load site,
+    /// preferring rich (image / vector buffer) uses.
+    descriptor_uses: HashMap<Site, (Site, u8)>,
+    /// Same as `descriptor_uses`, keyed by canonical twin-load signature for O(1)
+    /// waterfall twin-load matching.
+    twin_descriptor_uses: HashMap<TwinKey, (Site, u8)>,
+    /// Precomputed `v_readfirstlane_b32` SGPR def -> VGPR source map.
+    first_lane_src: HashMap<Value, Value>,
+    /// Precomputed set of values read by any phi or non-(Image|Buffer|Smem) inst.
+    data_reads: HashSet<Value>,
+    /// Precomputed set of values written by any `s_load_dword*` used as a descriptor.
+    descriptor_dwords: HashSet<Value>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
@@ -505,6 +552,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Whether any reachable block contains an active `s_barrier`.
+    any_active_barrier: bool,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -1131,6 +1180,65 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let mut data_reads = HashSet::new();
+        let mut first_lane_src = HashMap::new();
+        for block in &p.blocks {
+            for phi in &block.phis {
+                data_reads.extend(phi.args.iter().copied());
+            }
+            for inst in &block.insts {
+                if !matches!(
+                    inst.fields,
+                    Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
+                ) {
+                    data_reads.extend(inst.reads.iter().map(|r| r.1));
+                }
+                if inst.name() == "v_readfirstlane_b32"
+                    && let Some(&(_, vgpr)) =
+                        inst.reads.iter().find(|r| matches!(r.0, Reg::V(_)))
+                {
+                    for &(_, w) in &inst.writes {
+                        first_lane_src.insert(w, vgpr);
+                    }
+                }
+            }
+        }
+        let mut descriptor_uses: HashMap<Site, (Site, u8)> = HashMap::new();
+        let mut descriptor_uses_rich: HashSet<Site> = HashSet::new();
+        let mut twin_descriptor_uses: HashMap<TwinKey, (Site, u8)> = HashMap::new();
+        let mut twin_descriptor_uses_rich: HashSet<TwinKey> = HashSet::new();
+        let mut descriptor_dwords = HashSet::new();
+        for d in &x.res.descriptors {
+            let ui = &p.blocks[d.site.0].insts[d.site.1];
+            let rich = matches!(ui.fields, Fields::Image { .. } | Fields::Buffer { .. });
+            for l in d.source.leaves() {
+                if let Source::Loaded { load, first } = *l {
+                    let li = &p.blocks[load.0].insts[load.1];
+                    if li.name().starts_with("s_load_dword") {
+                        descriptor_dwords.extend(li.writes.iter().map(|w| w.1));
+                    }
+                    if d.role == Role::Resource {
+                        if !descriptor_uses_rich.contains(&load)
+                            && (rich || !descriptor_uses.contains_key(&load))
+                        {
+                            descriptor_uses.insert(load, (d.site, first));
+                            if rich {
+                                descriptor_uses_rich.insert(load);
+                            }
+                        }
+                        if let Some(key) = twin_load_key(li, &first_lane_src)
+                            && !twin_descriptor_uses_rich.contains(&key)
+                            && (rich || !twin_descriptor_uses.contains_key(&key))
+                        {
+                            twin_descriptor_uses.insert(key, (d.site, first));
+                            if rich {
+                                twin_descriptor_uses_rich.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Lower {
             s,
             x,
@@ -1159,6 +1267,11 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
+            descriptor_uses,
+            twin_descriptor_uses,
+            first_lane_src,
+            data_reads,
+            descriptor_dwords,
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
@@ -1174,6 +1287,7 @@ impl<'a> Lower<'a> {
             numeric_selects,
             flat: None,
             no_barrier,
+            any_active_barrier: false,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             half_inputs: half_inputs(&x.native.io, &x.inputs),
             mask_data: match x.native.stage {
@@ -1855,6 +1969,8 @@ impl<'a> Lower<'a> {
                 cur_val: None,
             });
         }
+        self.any_active_barrier = (0..p.blocks.len())
+            .any(|u| self.block[u].is_some() && self.has_active_barrier(u));
         self.find_loop_exits();
         self.cur = self.s.entry;
         self.find_sections();
@@ -5109,72 +5225,6 @@ impl<'a> Lower<'a> {
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
-    /// Two scalar loads of the same dwords: same opcode and immediate
-    /// offset, base read from the same values, and the same or an
-    /// equivalent register offset.
-    fn twin_loads(&self, a: Site, b: Site) -> bool {
-        let (ia, ib): (&Inst, &Inst) = (
-            &self.x.p.blocks[a.0].insts[a.1],
-            &self.x.p.blocks[b.0].insts[b.1],
-        );
-        let (
-            Fields::Smem {
-                base: Operand::Scalar { code: ba, .. },
-                offset: oa,
-                soffset: sa,
-                ..
-            },
-            Fields::Smem {
-                base: Operand::Scalar { code: bb, .. },
-                offset: ob,
-                soffset: sb,
-                ..
-            },
-        ) = (&ia.fields, &ib.fields)
-        else {
-            return false;
-        };
-        let same_base = (0..2).all(|k| {
-            let va = ia.read(Reg::S(ba + k));
-            va.is_some() && va == ib.read(Reg::S(bb + k))
-        });
-        let same_soffset = match (sa, sb) {
-            (Operand::Scalar { code: NULL, .. }, Operand::Scalar { code: NULL, .. }) => true,
-            (Operand::Scalar { code: ca, .. }, Operand::Scalar { code: cb, .. }) => {
-                match (ia.read(Reg::S(*ca)), ib.read(Reg::S(*cb))) {
-                    (Some(x), Some(y)) => self.same_scalar(x, y),
-                    _ => false,
-                }
-            }
-            _ => false,
-        };
-        ia.name() == ib.name() && oa == ob && same_base && same_soffset
-    }
-
-    /// The same value, or two `v_readfirstlane_b32` of the same VGPR value
-    /// (each waterfall loop reads the index anew).
-    fn same_scalar(&self, x: Value, y: Value) -> bool {
-        if x == y {
-            return true;
-        }
-        let first_lane_of = |v: Value| {
-            self.x
-                .p
-                .blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .find(|i| i.writes.iter().any(|w| w.1 == v))
-                .filter(|i| i.name() == "v_readfirstlane_b32")
-                .and_then(|i| {
-                    i.reads
-                        .iter()
-                        .find(|r| matches!(r.0, Reg::V(_)))
-                        .map(|r| r.1)
-                })
-        };
-        matches!((first_lane_of(x), first_lane_of(y)), (Some(a), Some(b)) if a == b)
-    }
-
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -5197,35 +5247,10 @@ impl<'a> Lower<'a> {
         // non-uniform index reloads the descriptor in each waterfall loop,
         // one for the size bits, another for the access). Prefer an image or
         // vector buffer use when a descriptor has both scalar and vector uses.
-        let find_use = |twin: &dyn Fn(Site) -> bool| {
-            let mut found: Option<(Site, u8)> = None;
-            for d in self
-                .x
-                .res
-                .descriptors
-                .iter()
-                .filter(|d| d.role == Role::Resource)
-            {
-                for l in d.source.leaves() {
-                    if let Source::Loaded { load, first } = *l
-                        && twin(load)
-                    {
-                        let ui = &self.x.p.blocks[d.site.0].insts[d.site.1];
-                        let rich =
-                            matches!(ui.fields, Fields::Image { .. } | Fields::Buffer { .. });
-                        if found.is_none() || rich {
-                            found = Some((d.site, first));
-                            if rich {
-                                return found;
-                            }
-                        }
-                    }
-                }
-            }
-            found
-        };
-        let use_at = find_use(&|load| load == site)
-            .or_else(|| find_use(&|load| self.twin_loads(site, load)));
+        let use_at = self.descriptor_uses.get(&site).copied().or_else(|| {
+            twin_load_key(inst, &self.first_lane_src)
+                .and_then(|k| self.twin_descriptor_uses.get(&k).copied())
+        });
         let (first, src, props, image, uav) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
             let used = self.used_kind(&src);
@@ -5398,15 +5423,7 @@ impl<'a> Lower<'a> {
     /// Whether an instruction or phi reads `v` other than as a resource
     /// operand of a memory instruction (which takes the descriptor whole).
     fn read_as_data(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    !matches!(
-                        i.fields,
-                        Fields::Image { .. } | Fields::Buffer { .. } | Fields::Smem { .. }
-                    ) && i.reads.iter().any(|r| r.1 == v)
-                })
-        })
+        self.data_reads.contains(&v)
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -10830,11 +10847,9 @@ impl<'a> Lower<'a> {
                 };
                 // Keep branches controlling an active `s_barrier` wave-uniform
                 // so individual lanes never diverge across `dx.op.barrier`.
-                let any_active_barrier = (0..self.x.p.blocks.len())
-                    .any(|u| self.block[u].is_some() && self.has_active_barrier(u));
                 if let Some(orig_all) = self.x.st.barrier_branches[b]
                     && self.s.threads.is_some()
-                    && any_active_barrier
+                    && self.any_active_barrier
                 {
                     let all = if swapped { !orig_all } else { orig_all };
                     let (name, opcode) = if all {
@@ -11170,24 +11185,7 @@ impl<'a> Lower<'a> {
     /// A dword a scalar load writes, where the load is a descriptor the
     /// program uses as a resource or sampler.
     fn descriptor_dword(&self, v: Value) -> bool {
-        let Some(load) = self.x.p.blocks.iter().enumerate().find_map(|(b, block)| {
-            block
-                .insts
-                .iter()
-                .position(|i| i.writes.iter().any(|w| w.1 == v))
-                .map(|i| (b, i))
-        }) else {
-            return false;
-        };
-        self.x.p.blocks[load.0].insts[load.1]
-            .name()
-            .starts_with("s_load_dword")
-            && self.x.res.descriptors.iter().any(|d| {
-                d.source
-                    .leaves()
-                    .iter()
-                    .any(|l| matches!(l, Source::Loaded { load: at, .. } if *at == load))
-            })
+        self.descriptor_dwords.contains(&v)
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
