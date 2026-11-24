@@ -898,7 +898,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res, Target::ANY).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -1088,7 +1088,7 @@ mod tests {
             let res = resource::track(&p, &native.layout, native.stage).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res);
+            let shader = emit(&c, &native, &p, &st, &io, &res, Target::ANY);
             if matches!(case, Complete | NonzeroBase) {
                 let shader = shader.unwrap();
                 assert!(
@@ -1277,7 +1277,7 @@ mod tests {
             let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let st = crate::structure::structure(&p).unwrap();
-            let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let out = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
             #[cfg(windows)]
             if let Ok(mut v) = super::validator::Validator::load(
@@ -1572,7 +1572,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        emit(&c, &native, &p, &st, &io, &res)
+        emit(&c, &native, &p, &st, &io, &res, Target::ANY)
     }
 
     /// The vertex and primitive maxima a translated mesh shader's `PSV0`
@@ -1685,6 +1685,7 @@ mod atomic_tests {
                 &structure::structure(&p).unwrap(),
                 &io::raise(&p, &native).unwrap(),
                 &resource::track(&p, &native.layout, native.stage).unwrap(),
+                Target::ANY,
             )
             .unwrap();
             let container = Container::parse(&shader.dxil).unwrap();
@@ -1822,7 +1823,7 @@ mod barycentric_tests {
         let res = resource::track(&p, &native.layout, native.stage)?;
         let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
-        emit(&c, &native, &p, &st, &io, &res)
+        emit(&c, &native, &p, &st, &io, &res, Target::ANY)
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
@@ -2119,6 +2120,9 @@ mod barycentric_tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

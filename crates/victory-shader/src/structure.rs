@@ -740,7 +740,11 @@ impl<'a> Lanes<'a> {
                     let (q, taken) = self.incoming[pj.block][n];
                     let e = self.edge(cond[q], q, taken);
                     let m = self.mask(a).0;
-                    self.b.given(m, e)
+                    if self.console {
+                        m
+                    } else {
+                        self.b.given(m, e)
+                    }
                 })
                 .collect();
             phi_masks.insert(pj.id, incoming);

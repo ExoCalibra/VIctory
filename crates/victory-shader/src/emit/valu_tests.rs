@@ -1336,6 +1336,9 @@ fn build_custom_cs(threads: u32, use_lds: bool, loop_limit: u32, body: &[u32]) -
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         },
         loop_limit,
     )
@@ -1544,6 +1547,9 @@ fn s_wqm_pixel_loop_and_skip_run_per_quad() {
             }],
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         },
         16,
     )
@@ -1973,7 +1979,7 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     let st = structure::structure(&p).expect("structure");
     let container = crate::dxbc::build(&[]);
     let c = crate::Container::parse(&container).expect("container");
-    let shader = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
+    let shader = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
 
     assert_eq!(shader.root_cbvs, vec![0]);
     assert_eq!(shader.root_srvs, vec![1]);
@@ -2537,7 +2543,7 @@ fn cvt_f32_f64_matches_rdna2() {
 
 /// A wave64 compute program of 64 lanes (thread id in v0) with `body` between
 /// the descriptor load and the store of v0 at byte 4 * lane.
-fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
+fn build_lanes_cs(body: &[u32], target: super::Target) -> Result<HostShader, String> {
     let mut words = Vec::new();
     words.push(s_mov_b32(5, 0x80));
     words.extend_from_slice(&s_load_dwordx4(8, 4));
@@ -2593,30 +2599,9 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
     let res = resource::track(&p, &native.layout, native.stage).map_err(|e| format!("{e:?}"))?;
     let io = io::raise(&p, &native).map_err(|e| format!("{e:?}"))?;
     let st = structure::structure(&p).map_err(|e| format!("{e:?}"))?;
-    let lowered = lower::lower(&lower::Parts {
-        psv: None,
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .map_err(|e| format!("{e:?}"))?;
-    Ok(HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        root_indexed_views: res.root_indexed_views,
-    })
+    let container = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&container).map_err(|e| format!("{e:?}"))?;
+    super::emit(&c, &native, &p, &st, &io, &res, target).map_err(|e| format!("{e:?}"))
 }
 
 /// A divergent loop's exit mask (lanes that left in earlier iterations, so
@@ -2636,11 +2621,11 @@ fn loop_exit_mask_counted_after_the_loop() {
         0xBE84_1002, // s_bcnt1_i32_b64 s4, s[2:3]
         0x7E00_0204, // v_mov_b32 v0, s4
     ];
-    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; skipped");
         return;
     };
+    let shader = build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("translation: {e}"));
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host
@@ -2681,8 +2666,8 @@ fn scalar_counted_in_a_divergent_loop_read_after_it() {
         0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
         0x7E00_0206, // v_mov_b32 v0, s6
     ];
-    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
     let host = Host::new(false).unwrap();
+    let shader = build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("translation: {e}"));
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host
@@ -2718,8 +2703,8 @@ fn mask_grown_inside_a_branch_counted_after_it() {
         0xBE86_1002, // s_bcnt1_i32_b64 s6, s[2:3]
         0x7E00_0206, // v_mov_b32 v0, s6
     ];
-    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
     let host = Host::new(false).unwrap();
+    let shader = build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("translation: {e}"));
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host
@@ -2768,8 +2753,8 @@ fn scalar_counted_in_nested_divergent_loops() {
         0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
         0x7E00_0206, // v_mov_b32 v0, s6
     ];
-    let shader = build_lanes_cs(&body).unwrap_or_else(|e| panic!("translation: {e}"));
     let host = Host::new(false).unwrap();
+    let shader = build_lanes_cs(&body, host.target()).unwrap_or_else(|e| panic!("translation: {e}"));
     let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
     let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
     let out = host

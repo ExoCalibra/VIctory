@@ -50,7 +50,7 @@ impl Gpu {
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        let mut shader = emit(&c, &native, &p, &st, &io, &res)
+        let mut shader = emit(&c, &native, &p, &st, &io, &res, super::Target::ANY)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         if let Some(v) = &mut self.validator {
             v.validate(&mut shader.dxil).unwrap_or_else(|e| panic!("{name}: {e}"));

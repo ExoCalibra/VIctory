@@ -342,7 +342,7 @@ mod tests {
         let st = structure::structure(&p)?;
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
-        let shader = crate::emit::emit(&c, &native, &p, &st, &io, &res)?;
+        let shader = crate::emit::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY)?;
         let out = Container::parse(&shader.dxil).unwrap();
         let psv = out.part(crate::FourCC::PSV0).unwrap();
         Ok(u32::from_le_bytes(psv.data[20..24].try_into().unwrap()))

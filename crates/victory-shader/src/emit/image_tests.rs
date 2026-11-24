@@ -232,7 +232,7 @@ fn lower(words: &[u32]) -> Result<HostShader, ShaderError> {
     let st = structure::structure(&p)?;
     let bytes = dxbc::build(&[]);
     let c = Container::parse(&bytes)?;
-    emit(&c, &n, &p, &st, &io, &res)
+    emit(&c, &n, &p, &st, &io, &res, super::Target::ANY)
 }
 
 fn host() -> Option<Host> {

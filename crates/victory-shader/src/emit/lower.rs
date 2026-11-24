@@ -590,6 +590,8 @@ struct Lower<'a> {
     console_cf: bool,
     /// Split without [`Self::console_cf`] cannot run it, the console flow can.
     wants_console_flow: bool,
+    /// Whether any branch in the program can diverge between lanes.
+    has_divergent_branch: bool,
     /// Why a wave64 program that needs its whole wave cannot take the
     /// console flow on a host without 64-lane waves.
     no_console_flow: Option<Why>,
@@ -1093,6 +1095,10 @@ impl<'a> Lower<'a> {
         let mut split = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
+        let has_divergent_branch = x.st.exits.iter().any(|e| {
+            matches!(*e, LaneExit::Branch { when, .. }
+                if !x.st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))))
+        });
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1158,14 +1164,18 @@ impl<'a> Lower<'a> {
                     x.st.masks.get(&m).copied()
                 });
                 // So are the selectors of selects that derive from neither
-                // EXEC nor a compare.
-                let selectors = insts().filter_map(|i| match &i.fields {
-                    Fields::Valu(v) if i.name() == "v_cndmask_b32" => match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) if code != NULL => i.read(Reg::S(code)),
+                // EXEC nor a compare (when the select is live and triggers retry).
+                let selectors = insts()
+                    .filter(|_| numeric_selects)
+                    .filter_map(|i| match &i.fields {
+                        Fields::Valu(v) if i.name() == "v_cndmask_b32" => match v.src.get(2) {
+                            Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                                i.read(Reg::S(code))
+                            }
+                            _ => None,
+                        },
                         _ => None,
-                    },
-                    _ => None,
-                });
+                    });
                 let selectors = selectors
                     .filter(|m| !x.st.masks.contains_key(m))
                     .filter_map(|m| x.st.others.get(&m).copied());
@@ -1267,7 +1277,8 @@ impl<'a> Lower<'a> {
             let lane_access_outside_sections = p.blocks.iter().enumerate().any(|(b, block)| {
                 let sections = super::wave::sections(p, b);
                 block.insts.iter().enumerate().any(|(i, inst)| {
-                    matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
+                    !dead.contains(&(b, i))
+                        && matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
                         && !sections
                             .iter()
                             .any(|(&start, s)| (start..=s.end).contains(&i))
@@ -1444,6 +1455,7 @@ impl<'a> Lower<'a> {
             split,
             console_cf: x.console_cf,
             wants_console_flow,
+            has_divergent_branch,
             no_console_flow,
             console_flat: None,
             xchg: None,
@@ -2189,7 +2201,8 @@ impl<'a> Lower<'a> {
             } else {
                 has_lane_loops = true;
             }
-            if self.mask_data == MaskData::Console {
+            if self.mask_data == MaskData::Console && !self.console_cf && self.has_divergent_branch
+            {
                 let blk = self.block[h].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(h, (phi, Vec::new()));
@@ -2223,7 +2236,9 @@ impl<'a> Lower<'a> {
         }
         self.any_active_barrier = (0..p.blocks.len())
             .any(|u| self.block[u].is_some() && self.has_active_barrier(u));
-        self.find_loop_exits();
+        if self.mask_data == MaskData::Console && !self.console_cf && self.has_divergent_branch {
+            self.find_loop_exits();
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -2269,11 +2284,13 @@ impl<'a> Lower<'a> {
                 self.vals.insert(phi.value, val);
             }
             // Compute programs only: their host waves are the console's, so a
-            // wave's value is the console wave's.
-            if self.mask_data == MaskData::Console {
-                self.leave_loops(b);
+            // wave's value is the console wave's. In console flow (or without
+            // divergent branches) every lane already runs together in console order.
+            if self.mask_data == MaskData::Console && !self.console_cf && self.has_divergent_branch
+            {
+                self.leave_loops(b)?;
                 if !self.loop_exits.contains_key(&b) {
-                    self.join_scalars(b);
+                    self.join_scalars(b)?;
                 }
             }
             let mut i = 0;
@@ -3479,6 +3496,8 @@ impl<'a> Lower<'a> {
         // a number built from scalars) is a mask held as a number: with console
         // lanes the lane tests its own bit.
         if self.console_lanes
+            && (!self.split || self.console_cf)
+            && (self.numeric_selects || self.console_cf)
             && let Some(m) = inst
                 .read(Reg::S(code))
                 .and_then(|m| self.x.st.others.get(&m).copied())
@@ -11137,13 +11156,49 @@ impl<'a> Lower<'a> {
     /// takes, in code order, with one set of scalar registers, so after the
     /// join every lane reads what the last path run left; here each lane
     /// reads what its own path left. Each lane's path is ranked by its code
+    /// Requires the console's wave size for `join_scalars` / `leave_loops`.
+    /// On a host without 64-lane waves, a single-wave wave64 program switches
+    /// to console flow so every lane runs every block and iteration together.
+    fn need_console_wave_scalars(&mut self) -> Result<(), Stop> {
+        let wave = self.wave();
+        if !self.x.target.runs(wave) {
+            let threads = self.s.threads.map(|t| t.iter().product::<u32>());
+            let has_sections = (0..self.x.p.blocks.len())
+                .any(|b| !self.sections.get(&b).is_none_or(HashMap::is_empty));
+            let can_console_cf = self.x.native.wave64
+                && !self.x.per_lane_only
+                && self.x.target.runs(32)
+                && threads.is_some_and(|n| n <= 64)
+                && !self
+                    .x
+                    .p
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| i.name().contains("permute") && i.name() != "ds_bpermute_b32")
+                && (threads == Some(64) || !has_sections);
+            if can_console_cf {
+                return Err(unsupported(0, CONSOLE_FLOW));
+            }
+            return Err(unsupported(
+                0,
+                "console wave64 scalars in a group of more than 64 threads on a host without 64-lane waves",
+            ));
+        }
+        self.s.flags |= flags::WAVE_OPS;
+        self.s.wave_size = Some(wave);
+        Ok(())
+    }
+
+    /// Entering `b` (not a loop exit): scalars written on one path of a
+    /// divergent branch and read after it. The console runs both paths in
     /// order, and the lanes of the highest rank hold the wave's values.
     // shortcut: a scalar both paths change is the later path's own result,
     // not that path run on the earlier one's.
-    fn join_scalars(&mut self, b: usize) {
+    fn join_scalars(&mut self, b: usize) -> Result<(), Stop> {
         let p = self.x.p;
         if self.counters.contains_key(&b) {
-            return;
+            return Ok(());
         }
         let scalar = |r: Reg| match r {
             Reg::S(c) => c != EXEC && c != EXEC + 1,
@@ -11154,11 +11209,14 @@ impl<'a> Lower<'a> {
             .filter(|&i| {
                 let phi = &p.blocks[b].phis[i];
                 scalar(phi.reg)
+                    && !self.x.st.masks.contains_key(&phi.value)
+                    && !self.x.st.highs.contains_key(&phi.value)
+                    && !self.x.st.phi_masks.contains_key(&phi.value)
                     && matches!(self.vals.get(&phi.value), Some(Val::I32(_) | Val::Bit(_)))
             })
             .collect();
         if joins.is_empty() {
-            return;
+            return Ok(());
         }
         // Reachable predecessors and the DXIL block each edge arrives from.
         let mut preds: Vec<(usize, usize)> = Vec::new();
@@ -11168,8 +11226,9 @@ impl<'a> Lower<'a> {
             preds.push((q, via));
         }
         if preds.len() < 2 {
-            return;
+            return Ok(());
         }
+        self.need_console_wave_scalars()?;
         let mut order: Vec<usize> = preds.iter().map(|&(q, _)| q).collect();
         order.sort_by_key(|&q| (p.blocks[q].offset, self.rpo[q]));
         order.dedup();
@@ -11197,8 +11256,6 @@ impl<'a> Lower<'a> {
         };
         let last = wave_max(self, rank);
         let mine = self.s.m.cmp(c, pred::EQ, rank, last);
-        self.s.flags |= flags::WAVE_OPS;
-        self.s.wave_size = Some(self.wave());
         let zero = self.s.m.i32(0);
         for i in joins {
             let v = p.blocks[b].phis[i].value;
@@ -11217,6 +11274,7 @@ impl<'a> Lower<'a> {
             };
             self.vals.insert(v, f);
         }
+        Ok(())
     }
 
     /// Entering `b`, the block lanes leave loops through: the scalar values
@@ -11227,9 +11285,9 @@ impl<'a> Lower<'a> {
     /// iterations hold the wave's (a scalar is the same in all of them).
     // shortcut: a value lowered after this block (a loop block later in
     // reverse postorder) keeps each lane's own.
-    fn leave_loops(&mut self, b: usize) {
+    fn leave_loops(&mut self, b: usize) -> Result<(), Stop> {
         let Some(loops) = self.loop_exits.get(&b).cloned() else {
-            return;
+            return Ok(());
         };
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -11256,6 +11314,7 @@ impl<'a> Lower<'a> {
             if live_values.is_empty() && live_phis.is_empty() {
                 continue;
             }
+            self.need_console_wave_scalars()?;
             let (count, _) = self.counters[&h];
             let (max, unsigned) = (self.s.m.i8(3), self.s.m.i8(1));
             let wave_max = |l: &mut Self, x: V| {
@@ -11270,8 +11329,6 @@ impl<'a> Lower<'a> {
             };
             let last = wave_max(self, count);
             let mine = self.s.m.cmp(c, pred::EQ, count, last);
-            self.s.flags |= flags::WAVE_OPS;
-            self.s.wave_size = Some(self.wave());
             let zero = self.s.m.i32(0);
             let final_of = |l: &mut Self, val: Val| -> Val {
                 match val {
@@ -11298,6 +11355,7 @@ impl<'a> Lower<'a> {
                 self.vals.insert(v, f);
             }
         }
+        Ok(())
     }
 
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
@@ -12266,6 +12324,9 @@ mod tests {
             outputs: vec![target],
             prims: vec![],
             mesh_stride: 0,
+            target: Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .map(|_| ())
     }
@@ -12345,6 +12406,9 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            target: Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
     }
 
@@ -12943,7 +13007,7 @@ mod tests {
         let bases: Vec<usize> = l
             .iter()
             .enumerate()
-            .filter(|(i, s)| {
+            .filter(|(_i, s)| {
                 s.starts_with("bin:And ")
                     && lanes.iter().any(|n| **s == format!("bin:And i{n} k32"))
             })
@@ -13102,6 +13166,9 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            target: Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
         })
         .unwrap();
 
@@ -13239,6 +13306,9 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                target: Target::ANY,
+                console_cf: false,
+                per_lane_only: false,
             })
             .unwrap();
         }
@@ -13298,6 +13368,9 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                target: Target::ANY,
+                console_cf: false,
+                per_lane_only: false,
             })
             .unwrap();
         }
@@ -13356,6 +13429,9 @@ mod tests {
                 outputs: vec![],
                 prims: vec![],
                 mesh_stride: 0,
+                target: Target::ANY,
+                console_cf: false,
+                per_lane_only: false,
             })
             .unwrap();
         }
@@ -13498,7 +13574,7 @@ mod select_tests {
             let st = crate::structure::structure(&p).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-            let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res, super::super::Target::ANY).unwrap();
             let emitted = Container::parse(&shader.dxil).unwrap();
             let features = emitted.part(FourCC::SFI0).unwrap();
             let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;

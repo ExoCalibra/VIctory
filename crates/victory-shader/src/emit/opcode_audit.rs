@@ -191,8 +191,10 @@ fn translate(native: &NativeProgram, offset: usize) -> Result<(), (&'static str,
     let st = structure::structure(&p).map_err(|e| ("structure", e))?;
     lower::AUDIT_OFFSET.set(Some(offset));
     let lowered = lower::lower(&lower::Parts {
+        psv: None,
         native, p: &p, st: &st, io: &io, res: &res, inputs: Vec::new(), outputs: Vec::new(),
         prims: Vec::new(), mesh_stride: 0,
+        target: super::Target::ANY, console_cf: false, per_lane_only: false,
     });
     lower::AUDIT_OFFSET.set(None);
     lowered.map(|_| ()).map_err(|e| ("lower", e))
