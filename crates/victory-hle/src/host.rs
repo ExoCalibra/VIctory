@@ -42,6 +42,9 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            // BSTR allocation/free (`SysAllocStringLen` #4, `SysFreeString` #6),
+            // imported by ordinal from `vccorlib140.dll`.
+            "oleaut32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
@@ -144,5 +147,63 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_allows_oleaut32() {
+        assert!(HostPolicy::default().allows("OLEAUT32.dll"));
+        assert!(!HostPolicy::none().allows("OLEAUT32.dll"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn oleaut32_ordinals_4_and_6_resolve_to_bstr_functions() {
+        let policy = HostPolicy::default();
+        let alloc_ord = policy
+            .resolve("OLEAUT32.dll", &ImportSymbol::Ordinal(4))
+            .expect("OLEAUT32.dll!#4");
+        let alloc_name = policy
+            .resolve(
+                "OLEAUT32.dll",
+                &ImportSymbol::Name {
+                    hint: 0,
+                    name: "SysAllocStringLen".into(),
+                },
+            )
+            .expect("OLEAUT32.dll!SysAllocStringLen");
+        assert_eq!(alloc_ord, alloc_name);
+
+        let free_ord = policy
+            .resolve("OLEAUT32.dll", &ImportSymbol::Ordinal(6))
+            .expect("OLEAUT32.dll!#6");
+        let free_name = policy
+            .resolve(
+                "OLEAUT32.dll",
+                &ImportSymbol::Name {
+                    hint: 0,
+                    name: "SysFreeString".into(),
+                },
+            )
+            .expect("OLEAUT32.dll!SysFreeString");
+        assert_eq!(free_ord, free_name);
+
+        // Round-trip a short UTF-16 string through the resolved entry points.
+        // SAFETY: `alloc_ord` and `free_ord` match `SysAllocStringLen` and `SysFreeString`
+        // from System32's `oleaut32.dll` with the standard `system` ABI.
+        unsafe {
+            let alloc: unsafe extern "system" fn(*const u16, u32) -> *mut u16 =
+                std::mem::transmute(alloc_ord);
+            let free: unsafe extern "system" fn(*mut u16) = std::mem::transmute(free_ord);
+            let src = [b'o' as u16, b'k' as u16];
+            let bstr = alloc(src.as_ptr(), src.len() as u32);
+            assert!(!bstr.is_null());
+            assert_eq!(std::slice::from_raw_parts(bstr, src.len()), &src);
+            free(bstr);
+        }
     }
 }
