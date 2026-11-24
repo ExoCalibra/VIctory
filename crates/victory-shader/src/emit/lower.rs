@@ -5751,7 +5751,12 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| self.in_constants(a)) {
+        if let Some(a) = self
+            .scalar
+            .get(&site)
+            .copied()
+            .filter(|a| self.in_constants(a))
+        {
             return self.pair_smem(inst, a);
         }
         let root_desc = self.scalar.get(&site).copied().and_then(|a| {
