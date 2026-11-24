@@ -1431,6 +1431,7 @@ mod tests {
             root_uavs: vec![],
             root_indexed_views: vec![],
             address_srvs: vec![],
+            table_views: vec![],
         };
 
         let mut gs_words = own_ring;

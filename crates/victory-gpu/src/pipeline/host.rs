@@ -1602,6 +1602,7 @@ float4 ps(V input) : SV_Target { return input.color; }
                     root_uavs: Vec::new(),
                     root_indexed_views: Vec::new(),
                     address_srvs: Vec::new(),
+                    table_views: Vec::new(),
                 },
                 used: Vec::new(),
                 resource_heap: false,

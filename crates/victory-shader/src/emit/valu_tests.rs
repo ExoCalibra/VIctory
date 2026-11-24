@@ -3423,6 +3423,7 @@ fn build_root_srv_cs(body: &[u32]) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: Vec::new(),
         address_srvs: lowered.address_srvs,
+        table_views: lowered.table_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

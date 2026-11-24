@@ -1071,7 +1071,7 @@ mod tests {
             state.set_table(true, 0, heap.start + 32);
             state.set_table(true, 2, heap.start + 160);
             state.set_constants(true, 1, &[1], 0);
-            let static_only = state.tables(&list, &native.used, &[], true);
+            let static_only = state.tables(&list, &native.used, &[], &[], None, true);
             // A control with only the static resource list has no buffer at
             // the later index. Inspect it without dispatching an invalid read.
             assert!(!host.retains_resource(static_only[0].1 / 32 + 2));
@@ -1097,8 +1097,14 @@ mod tests {
             if selector == 0 {
                 state.bind(&list, &pipeline, true);
             }
-            let made =
-                state.tables(&list, &translated.used, &translated.host.root_indexed_views, true);
+            let made = state.tables(
+                &list,
+                &translated.used,
+                &translated.host.root_indexed_views,
+                &translated.host.table_views,
+                Some(&pipeline),
+                true,
+            );
             assert_eq!(made.len(), 1);
             assert!(host.retains_resource(made[0].1 / 32 + 1 + selector));
             if selector == 1 {

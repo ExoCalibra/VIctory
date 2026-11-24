@@ -3112,9 +3112,9 @@ void main() {
         };
         let kept = |index: u32| heap.kept.lock().unwrap()[index as usize].is_some();
         for unordered in [false, true] {
-            heap.make_at(0, &placed(unordered, 1));
+            heap.make_at(0, &placed(unordered, 1), None);
             assert!(kept(0), "a view of an element (unordered: {unordered})");
-            heap.make_at(1, &placed(unordered, 0));
+            heap.make_at(1, &placed(unordered, 0), None);
             assert!(!kept(1), "a view of no elements (unordered: {unordered})");
             // SAFETY: a plain device query.
             let removed = unsafe { host.device.GetDeviceRemovedReason() };
@@ -3752,7 +3752,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         for idx in 0..=5 {
             assert_eq!(
                 host_heap.made.lock().unwrap()[idx],
-                0,
+                SlotState::Null,
                 "slot {idx} starts deferred"
             );
         }
@@ -3879,7 +3879,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(reused, "unchanged slots reuse the plan");
 
         // Slot 0 marked unmade: were it made again, it would be made anew.
-        host_heap.made.lock().unwrap()[0] = 0;
+        host_heap.made.lock().unwrap()[0] = SlotState::Null;
         cbv(mem.address() + 0x1000, 1);
         let second = host_heap.bindless_plan().unwrap();
         assert!(
@@ -3891,10 +3891,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(second.reads[0].2, 0x1100);
         assert_eq!(
             host_heap.made.lock().unwrap()[0],
-            0,
+            SlotState::Null,
             "only the written slot is made again"
         );
-        assert_ne!(host_heap.made.lock().unwrap()[1], 0);
+        assert_ne!(host_heap.made.lock().unwrap()[1], SlotState::Null);
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);

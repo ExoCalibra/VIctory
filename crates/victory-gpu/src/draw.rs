@@ -832,7 +832,7 @@ impl State {
                 &t.used,
                 &t.host.root_indexed_views,
                 &t.host.table_views,
-                p,
+                Some(p),
                 compute,
             );
             if self.table_failed {
@@ -1220,7 +1220,13 @@ impl State {
         }
     }
 
-    fn table_entry(&mut self, list: &HostList, u: &UsedResource, p: &HostPipeline, compute: bool) {
+    fn table_entry(
+        &mut self,
+        list: &HostList,
+        u: &UsedResource,
+        p: Option<&HostPipeline>,
+        compute: bool,
+    ) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -1231,7 +1237,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        let props = table_view_props(p, u.slot, u.table_offset_dwords);
+        let props = p.and_then(|p| table_view_props(p, u.slot, u.table_offset_dwords));
         if let Some(view) = host.mirror_for_draw(index, handle, props) {
             self.depth_sampled |= readable(list, u.kind, &view, self.read_only_depth(compute));
         }
@@ -1241,7 +1247,7 @@ impl State {
     /// (a later element of a descriptor range): a typed null when the title
     /// has no view there. Slots with a view are left as before; making one
     /// here would skip what `readable` does for it.
-    fn table_view_entry(&self, slot: u8, dword: u32, p: &HostPipeline, compute: bool) {
+    fn table_view_entry(&self, slot: u8, dword: u32, p: Option<&HostPipeline>, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
             return;
         };
@@ -1255,7 +1261,7 @@ impl State {
         if crate::descriptor::view(handle).is_some() {
             return;
         }
-        let props = table_view_props(p, slot, dword);
+        let props = p.and_then(|p| table_view_props(p, slot, dword));
         let _ = host.mirror_for_draw(index, handle, props);
     }
 
@@ -1280,7 +1286,7 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         stage_views: &[victory_shader::emit::TableView],
-        p: &HostPipeline,
+        p: Option<&HostPipeline>,
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let read_only_depth = self.read_only_depth(compute);
@@ -1463,8 +1469,8 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .chain(selected.last().map(|&k| k + 1))
                 .chain(
-                    p.stages
-                        .iter()
+                    p.into_iter()
+                        .flat_map(|p| &p.stages)
                         .flat_map(|s| &s.translated().host.table_views)
                         .filter(|v| v.slot == slot)
                         .map(|v| v.dword / 8 + 1),
@@ -1493,7 +1499,8 @@ impl State {
                         [0; 3]
                     };
                     words.hash(&mut h);
-                    table_view_props(p, slot, k * 8).hash(&mut h);
+                    p.and_then(|p| table_view_props(p, slot, k * 8))
+                        .hash(&mut h);
                 }
                 (table, n, h.finish())
             };
@@ -1534,7 +1541,7 @@ impl State {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 let at = table + u64::from(k) * 32;
-                let props = table_view_props(p, slot, k * 8);
+                let props = p.and_then(|p| table_view_props(p, slot, k * 8));
                 match heap.index(at).and_then(|_| crate::descriptor::view(at)) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -2575,7 +2582,7 @@ mod depth_tests {
                 no_transition(unsampled_state),
                 "unsampled depth state for {flags:?}"
             );
-            state.tables(&list, &[used], &[], false);
+            state.tables(&list, &[used], &[], &[], None, false);
             assert!(
                 no_transition(shader_state),
                 "shader-table state for {flags:?}"
@@ -3542,19 +3549,19 @@ mod address_srv_tests {
 
         // 1) Aligned CBV table: zero dynamic slots allocated, not remapped.
         state.set_table(false, 0, heap_start);
-        let made = state.tables(&list, &used, &[], false);
+        let made = state.tables(&list, &used, &[], &[], None, false);
         assert!(!state.table_failed);
         assert!(made.is_empty(), "aligned CBV table should not allocate dynamic slots");
 
         // 2) Misaligned (+16) CBV table: allocates dynamic slots.
         state.set_table(false, 0, heap_start + 32);
-        let made = state.tables(&list, &used, &[], false);
+        let made = state.tables(&list, &used, &[], &[], None, false);
         assert!(!state.table_failed);
         assert_eq!(made.len(), 1, "misaligned CBV table must use dynamic slots");
 
         // 3) CBV whose 256-byte-padded size exceeds shadow end: allocates dynamic slots.
         state.set_table(false, 0, heap_start + 64);
-        let made = state.tables(&list, &used, &[], false);
+        let made = state.tables(&list, &used, &[], &[], None, false);
         assert!(!state.table_failed);
         assert_eq!(made.len(), 1, "CBV padded past shadow end must use dynamic slots");
 
