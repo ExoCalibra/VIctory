@@ -76,9 +76,10 @@ pub(crate) struct HostHeap {
     /// Per slot, what shaders need to read a buffer whose stride shader
     /// analysis could not recover statically ([`StrideEntry`]).
     strides: Option<StrideTable>,
-    /// The first of the [`ALIASES`] slots after the dynamic ones (view
+    /// The first of the `alias_count` slots after the dynamic ones (view
     /// heaps), and which slots have a raw view there.
     alias_base: u32,
+    alias_count: u32,
     aliases: Mutex<Aliases>,
 }
 
@@ -315,6 +316,11 @@ struct Aliases {
 /// warning); the count is a guess, not a measured need.
 const ALIASES: u32 = 1 << 16;
 
+/// Alias pool size when the host caps the view heap at [`PORTABLE_VIEWS`]
+/// (NVIDIA 1M limit): preserves +32 Ki directly-mirrored title slots while
+/// aliases recycle through [`Aliases::free`].
+const ALIASES_CAPPED: u32 = 1 << 15;
+
 /// The pool's first slots: null raw views (a shader view, an unordered
 /// access one) for views that cannot have a raw view of their own.
 const NULL_ALIASES: u32 = 2;
@@ -411,9 +417,11 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 pub(crate) const DYNAMIC: u32 = 1 << 19;
 
 /// Dynamic slots when the host caps the whole view heap at [`PORTABLE_VIEWS`]
-/// (NVIDIA Tier 2/3 1M limit): 2^18 (262,144) leaves 737,856 mirrored title
-/// slots while preventing world-load dynamic slot exhaustion.
-const DYNAMIC_CAPPED: u32 = 1 << 18;
+/// (NVIDIA Tier 2/3 1M limit): with in-place aligned CBV mirroring (#840) and
+/// finished-list dynamic slot reclamation (#688), 2^16 (65,536) dynamic slots
+/// plus [`ALIASES_CAPPED`] (32,768) raw-view aliases leaves 901,695 directly
+/// mirrored title slots (covering the persistent/bindless descriptor range).
+const DYNAMIC_CAPPED: u32 = 1 << 16;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -465,33 +473,42 @@ impl HostHeap {
                 kind,
                 SAMPLERS - SAMPLER_DYNAMIC,
                 SAMPLER_DYNAMIC,
+                0,
             );
         }
-        let aliases = if sampler { 0 } else { ALIASES };
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the capped dynamic range, and the portable cap.
         // A view heap ends with its guard slot (see [`HostHeap::guard_slot`]).
-        let (heap, count, extra) = if sampler {
+        let (heap, count, extra, aliases) = if sampler {
             match make(count) {
-                Ok(heap) => (heap, count, 0),
+                Ok(heap) => (heap, count, 0, 0),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC + aliases + 1) {
-            (heap, count, DYNAMIC)
+        } else if let Ok(heap) = make(count + DYNAMIC + ALIASES + 1) {
+            (heap, count, DYNAMIC, ALIASES)
         } else {
-            match make(count + DYNAMIC_CAPPED + aliases + 1) {
-                Ok(heap) => (heap, count, DYNAMIC_CAPPED),
-                Err(e) if count + DYNAMIC_CAPPED + aliases + 1 > PORTABLE_VIEWS => {
+            match make(count + DYNAMIC_CAPPED + ALIASES + 1) {
+                Ok(heap) => (heap, count, DYNAMIC_CAPPED, ALIASES),
+                Err(e) if count + DYNAMIC_CAPPED + ALIASES + 1 > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; tables past `count` go through dynamic slots.
-                    tracing::warn!(error = %e, count, dynamic = DYNAMIC_CAPPED, "host view heap capped at {PORTABLE_VIEWS}");
+                    let title = PORTABLE_VIEWS - DYNAMIC_CAPPED - ALIASES_CAPPED - 1;
+                    tracing::warn!(
+                        error = %e,
+                        count,
+                        title,
+                        dynamic = DYNAMIC_CAPPED,
+                        aliases = ALIASES_CAPPED,
+                        "host view heap capped at {PORTABLE_VIEWS}"
+                    );
                     (
                         make(PORTABLE_VIEWS).ok()?,
-                        PORTABLE_VIEWS - DYNAMIC_CAPPED - aliases - 1,
+                        title,
                         DYNAMIC_CAPPED,
+                        ALIASES_CAPPED,
                     )
                 }
                 Err(e) => {
@@ -500,20 +517,21 @@ impl HostHeap {
                 }
             }
         };
-        Self::with(host, heap, kind, count, extra)
+        Self::with(host, heap, kind, count, extra, aliases)
     }
 
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
-    /// ones, plus one trailing guard slot on view heaps, all made null.
+    /// ones, then `aliases` raw-view slots plus one trailing guard slot on view
+    /// heaps, all made null.
     fn with(
         host: &Host,
         heap: ID3D12DescriptorHeap,
         kind: D3D12_DESCRIPTOR_HEAP_TYPE,
         count: u32,
         extra: u32,
+        aliases: u32,
     ) -> Option<Self> {
         let sampler = kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-        let aliases = if sampler { 0 } else { ALIASES };
         let total = count + extra + aliases + u32::from(!sampler);
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -549,6 +567,7 @@ impl HostHeap {
             bindless: Mutex::default(),
             strides,
             alias_base: count + extra,
+            alias_count: aliases,
             aliases: Mutex::new(Aliases {
                 of: HashMap::new(),
                 free: Vec::new(),
@@ -712,7 +731,7 @@ impl HostHeap {
         if self.sampler {
             (self.count + self.spare).saturating_sub(1)
         } else {
-            self.count + self.spare + ALIASES
+            self.count + self.spare + self.alias_count
         }
     }
 
@@ -956,10 +975,13 @@ impl HostHeap {
         null_props: Option<(u32, u32)>,
     ) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, Ordering::Relaxed) < index {
+            // Diagnostic (NVIDIA heap cap): log at most once per 64 Ki-slot
+            // bucket (not per +1 increment, which stalls sequential title heap
+            // initialization on console stdout until the startup watchdog fires).
+            static HIGHEST_BUCKET: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0);
+            let bucket = (index >> 16) + 1;
+            if HIGHEST_BUCKET.fetch_max(bucket, Ordering::Relaxed) < bucket {
                 tracing::warn!(
                     index,
                     count = self.count,
@@ -2009,7 +2031,7 @@ impl HostHeap {
             let slot = match a.of.get(&index) {
                 Some(&slot) => Some(slot),
                 None => a.free.pop().or_else(|| {
-                    (a.next < ALIASES).then(|| {
+                    (a.next < self.alias_count).then(|| {
                         a.next += 1;
                         a.next - 1
                     })
