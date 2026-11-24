@@ -19,8 +19,9 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; `spare` more follow them.
     count: u32,
-    /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap,
-    /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
+    /// Dynamic slots past the title's: [`DYNAMIC`] (or [`DYNAMIC_CAPPED`] when
+    /// capped) in a view heap, [`SAMPLER_DYNAMIC`] in a capped sampler heap,
+    /// none in another.
     spare: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -65,9 +66,13 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
-/// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
-const DYNAMIC: u32 = 1 << 18;
+/// 2^16 ran out seconds into the world (#59, #71).
+const DYNAMIC: u32 = 1 << 19;
+
+/// Dynamic slots when the host caps the whole view heap at [`PORTABLE_VIEWS`]
+/// (NVIDIA Tier 2/3 1M limit): 2^18 (262,144) leaves 737,856 mirrored title
+/// slots while preventing world-load dynamic slot exhaustion.
+const DYNAMIC_CAPPED: u32 = 1 << 18;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -108,29 +113,46 @@ impl HostHeap {
                     return None;
                 }
             };
-            return Some(Self::with(
+            return Self::with(
                 host,
                 heap,
                 kind,
                 SAMPLERS - SAMPLER_DYNAMIC,
                 SAMPLER_DYNAMIC,
-            ));
+            );
         }
-        let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
+        // The larger dynamic range only where the host takes it on top of
+        // every title slot; else the capped dynamic range, and the portable cap.
+        let (heap, count, extra) = if sampler {
+            match make(count) {
+                Ok(heap) => (heap, count, 0),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        } else if let Ok(heap) = make(count + DYNAMIC) {
+            (heap, count, DYNAMIC)
+        } else {
+            match make(count + DYNAMIC_CAPPED) {
+                Ok(heap) => (heap, count, DYNAMIC_CAPPED),
+                Err(e) if count + DYNAMIC_CAPPED > PORTABLE_VIEWS => {
+                    // shortcut: descriptors past the host's limit are left
+                    // out; tables past `count` go through dynamic slots.
+                    tracing::warn!(error = %e, count, dynamic = DYNAMIC_CAPPED, "host view heap capped at {PORTABLE_VIEWS}");
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - DYNAMIC_CAPPED,
+                        DYNAMIC_CAPPED,
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
         };
-        Some(Self::with(host, heap, kind, count, extra))
+        Self::with(host, heap, kind, count, extra)
     }
 
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
@@ -141,7 +163,7 @@ impl HostHeap {
         kind: D3D12_DESCRIPTOR_HEAP_TYPE,
         count: u32,
         extra: u32,
-    ) -> Self {
+    ) -> Option<Self> {
         let sampler = kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -150,7 +172,7 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
+        tracing::debug!(count, extra, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -180,7 +202,7 @@ impl HostHeap {
             return None;
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
-        h
+        Some(h)
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
@@ -1161,14 +1183,14 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(DYNAMIC - 100).unwrap();
+        let a = heap.dynamic(heap.spare - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + DYNAMIC - 100));
+        assert_eq!((a, b), (4, 4 + heap.spare - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+        assert_eq!(heap.dynamic(40), Some(4 + heap.spare - 40));
     }
 
     /// A structured view whose start in its host copy is not on an element
