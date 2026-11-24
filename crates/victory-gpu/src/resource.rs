@@ -545,6 +545,27 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether a DXGI format is typeless (the root of a multi-format family).
+pub(crate) fn is_typeless(format: u32) -> bool {
+    format
+        .checked_add(1)
+        .is_some_and(|next| family(format) == format && family(next) == format)
+}
+
+/// The first concrete (readable) format in a typeless format's family.
+/// If `format` is already concrete or has no family, returns `format` unchanged.
+pub(crate) fn first_concrete(format: u32) -> u32 {
+    match format {
+        19 => 21, // DXGI_FORMAT_R32G8X24_TYPELESS -> DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS (skip 20: D32_FLOAT_S8X24_UINT)
+        39 => 41, // DXGI_FORMAT_R32_TYPELESS -> DXGI_FORMAT_R32_FLOAT (skip 40: D32_FLOAT)
+        44 => 46, // DXGI_FORMAT_R24G8_TYPELESS -> DXGI_FORMAT_R24_UNORM_X8_TYPELESS (skip 45: D24_UNORM_S8_UINT)
+        90 => 87, // DXGI_FORMAT_B8G8R8A8_TYPELESS -> DXGI_FORMAT_B8G8R8A8_UNORM
+        92 => 88, // DXGI_FORMAT_B8G8R8X8_TYPELESS -> DXGI_FORMAT_B8G8R8X8_UNORM
+        f if is_typeless(f) => f + 1,
+        f => f,
+    }
+}
+
 /// sRGB formats and their linear UNORM twins (color targets and BC formats).
 pub(crate) const SRGB: [(u32, u32); 7] = [
     (29, 28), // R8G8B8A8
@@ -3477,5 +3498,28 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         // Ordinary buffer -> stays 1 mip
         assert_eq!(get_desc(&buffer(256)).mip_levels, 1);
+    }
+
+    #[test]
+    fn typeless_detection_and_concrete_mapping() {
+        assert!(is_typeless(27));
+        assert_eq!(first_concrete(27), 28);
+
+        assert!(is_typeless(90));
+        assert_eq!(first_concrete(90), 87);
+
+        assert!(is_typeless(92));
+        assert_eq!(first_concrete(92), 88);
+
+        assert!(is_typeless(39));
+        assert_eq!(first_concrete(39), 41);
+
+        assert!(!is_typeless(28));
+        assert_eq!(first_concrete(28), 28);
+
+        assert!(!is_typeless(87));
+        assert_eq!(first_concrete(87), 87);
+        assert_eq!(first_concrete(19), 21);
+        assert_eq!(first_concrete(44), 46);
     }
 }
