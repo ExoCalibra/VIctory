@@ -146,6 +146,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -394,6 +395,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -412,6 +415,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1079,13 +1083,20 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &bounded);
-            why("prepare failed");
+            #[cfg(feature = "diagnostics")]
+            match crate::pipeline::host_pipeline(self.pipeline as This) {
+                None => crate::pipeline::note_drop(self.pipeline as This),
+                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        if let Some((s, _)) = &counter {
+            list.buffer_state(&s.buffer, crate::host::BUFFER_READ);
+        }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -1162,6 +1173,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {

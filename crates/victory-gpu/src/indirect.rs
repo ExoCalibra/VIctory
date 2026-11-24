@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{BUFFER_READ, BUFFER_WRITE, HostList, host};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -239,10 +239,15 @@ pub(crate) fn bound(
 ) -> Option<Bounded> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    let written = written_among(src.0, count.map(|(b, _)| b), |b| list.gpu_written(b));
-    record_clamp(c, &list.list, &dst, budget, src, count, spec, &written).then_some(Bounded {
+    // Title buffers are managed by `HostList::buffer_state` (#334); move both
+    // to `BUFFER_READ` here so `record_clamp` only transitions its own scratch.
+    list.buffer_state(src.0, crate::host::BUFFER_READ);
+    if let Some((buf, _)) = count {
+        list.buffer_state(buf, crate::host::BUFFER_READ);
+    }
+    record_clamp(c, &list.list, &dst, budget, src, count, spec, &[]).then_some(Bounded {
         scratch: dst,
-        written,
+        written: Vec::new(),
     })
 }
 
@@ -335,9 +340,8 @@ fn record_clamp(
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` are
-    // promoted from `COMMON` unless `written` names them (in
-    // `UNORDERED_ACCESS`, moved to `READ`), while `dst` transitions
-    // `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // in `BUFFER_READ` (via `HostList::buffer_state`) or moved via `written`,
+    // while `dst` transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         let mut before = vec![
@@ -377,9 +381,8 @@ fn record_clamp(
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call, and the
-/// title buffers [`bound`] moved out of unordered access back to it (where
-/// the list's later shaders expect them).
+/// returns the scratch buffer to the common state for the next call, and any
+/// explicit `written` buffers (used by standalone tests) back to UAV.
 pub(crate) fn done(list: &HostList, bounded: &Bounded) {
     done_on(&list.list, &bounded.scratch, &bounded.written);
 }
@@ -396,7 +399,7 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource, written: 
             .map(|b| transition(b, READ, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)),
     );
     // SAFETY: an open list, a live scratch buffer in INDIRECT_ARGUMENT, and
-    // live written buffers in READ (moved there by `record_clamp`).
+    // any live written buffers in READ (moved there by `record_clamp`).
     unsafe { list.ResourceBarrier(&after) };
 }
 
