@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -34,6 +34,54 @@ enum Eval {
         i: Option<V>,
         j: Option<V>,
     },
+}
+
+/// Updates which have no native DXIL atomic instruction.
+#[derive(Clone, Copy)]
+enum AtomicUpdate {
+    Inc,
+    Dec,
+    ReverseSub,
+    MaskOr,
+    Wrap,
+    ClampSub,
+}
+
+/// An unformatted byte or halfword load. LLVM's DSInstructions.td and
+/// BUFInstructions.td model the D16 destinations as tied to their old value.
+fn subword_load(rest: &str) -> Option<(u32, bool, Option<u32>)> {
+    let (rest, half) = if let Some(n) = rest.strip_suffix("_d16_hi") {
+        (n, Some(16))
+    } else if let Some(n) = rest.strip_suffix("_d16") {
+        (n, Some(0))
+    } else {
+        (rest, None)
+    };
+    let (width, signed) = match rest {
+        "i8" | "sbyte" => (8, true),
+        "u8" | "ubyte" => (8, false),
+        "i16" | "sshort" => (16, true),
+        "u16" | "ushort" | "short" => (16, false),
+        _ => return None,
+    };
+    Some((width, signed, half))
+}
+
+fn ds_integer_atomic(name: &str) -> Option<(&str, bool, u8)> {
+    let (op, ty) = name.strip_prefix("ds_")?.rsplit_once('_')?;
+    let op = op.strip_suffix("_rtn").unwrap_or(op);
+    let wide = match ty {
+        "b32" | "u32" | "i32" => false,
+        "b64" | "u64" | "i64" => true,
+        _ => return None,
+    };
+    match op {
+        "add" | "sub" | "and" | "or" | "xor" | "min" | "max" | "wrxchg" | "wrxchg2"
+        | "wrxchg2st64" | "rsub" | "inc" | "dec" | "mskor" | "wrap" | "cmpst" => {
+            Some((op, wide, ty.as_bytes()[0]))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -218,6 +266,7 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    wide_lds: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -682,6 +731,8 @@ impl<'a> Lower<'a> {
                 Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
             ) && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        let wide_lds =
+            insts().any(|i| ds_integer_atomic(i.name()).is_some_and(|(_, wide, _)| wide));
         let mut console_lanes = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
@@ -861,6 +912,7 @@ impl<'a> Lower<'a> {
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            wide_lds,
             src0: None,
             console_lanes,
             numeric_selects,
@@ -967,9 +1019,12 @@ impl<'a> Lower<'a> {
     /// program's constant table, or from a root SRV/UAV at the address the
     /// title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
-        let Fields::Flat { dst, data, .. } = &inst.fields else {
+        let Fields::Flat { dst, data, lds, .. } = &inst.fields else {
             unreachable!()
         };
+        if *lds {
+            return Err("a global load directly into LDS");
+        }
         let name = inst.name();
         if let Some(rest) = name.strip_prefix("global_store_") {
             let n = match rest {
@@ -1021,16 +1076,15 @@ impl<'a> Lower<'a> {
         }
         let rest = name
             .strip_prefix("global_load_")
-            .ok_or("a global memory write")?;
-        let (n, sub) = match rest {
-            "dword" => (1, None),
-            "dwordx2" => (2, None),
-            "dwordx3" => (3, None),
-            "dwordx4" => (4, None),
-            "ubyte" => (1, Some((8, false))),
-            "sbyte" => (1, Some((8, true))),
-            "ushort" => (1, Some((16, false))),
-            "sshort" => (1, Some((16, true))),
+            .ok_or("a global store or atomic without root UAV address support")?;
+        let sub = subword_load(rest);
+        let n = match rest {
+            "dword" => 1,
+            "dwordx2" => 2,
+            "dwordx3" => 3,
+            "dwordx4" => 4,
+            "dword_addtid" => return Err("a global load with a console thread ID offset"),
+            _ if sub.is_some() => 1,
             _ => return Err(name),
         };
         let a = *self
@@ -1069,44 +1123,21 @@ impl<'a> Lower<'a> {
             match h {
                 None => l.code_dword(byte),
                 Some(h) => {
-                    let c = l.cur;
-                    let (u, mask, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i8(1), l.s.m.i32(4));
-                    let r = l.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        l.s.t.res_ret,
-                        139,
-                        &[h, byte, u, mask, al],
-                    );
-                    let x = l.s.m.extract(c, r, 0);
-                    Ok(l.as_int(x))
+                    let u = l.s.m.undef(l.s.t.i32);
+                    Ok(l.raw_dword(h, [byte, u]))
                 }
             }
         };
-        for k in 0..n {
-            let x = match sub {
-                None => {
-                    let four = self.s.m.i32(4 * k);
-                    let at = self.s.m.bin(c, Bin::Add, off, four);
-                    dword(self, at)?
-                }
-                Some((width, signed)) => {
-                    // shortcut: the field is taken not to cross a dword.
-                    let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
-                    let at = self.s.m.bin(c, Bin::And, off, not3);
-                    let w = dword(self, at)?;
-                    let byte = self.s.m.bin(c, Bin::And, off, three);
-                    let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                    let x = self.s.m.bin(c, Bin::LShr, w, sh);
-                    let left = self.s.m.i32(32 - width);
-                    let x = self.s.m.bin(c, Bin::Shl, x, left);
-                    self.s
-                        .m
-                        .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
-                }
-            };
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        if let Some((width, signed, half)) = sub {
+            let x = self.read_subword(off, width, signed, dword)?;
+            self.write_subword_result(inst, reg, x, half, guard)?;
+        } else {
+            for k in 0..n {
+                let four = self.s.m.i32(4 * k);
+                let at = self.s.m.bin(c, Bin::Add, off, four);
+                let x = dword(self, at)?;
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
         }
         Ok(())
     }
@@ -2567,6 +2598,282 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// Atomically updates one location. The first compare also obtains the
+    /// initial value, so every observation is atomic, even when it is i64.
+    fn atomic_update(&mut self, zero: V, exchange: impl FnOnce(&mut Self, V) -> V) -> V {
+        let head = self.cur;
+        let retry = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        self.s.m.terminate(head, Term::Br(retry));
+        self.cur = retry;
+        let ty = self.s.m.type_of(zero);
+        let expected = self.s.m.phi(retry, ty);
+        let old = exchange(self, expected);
+        let success = self.s.m.cmp(retry, pred::EQ, expected, old);
+        self.s.m.set_phi(expected, vec![(zero, head), (old, retry)]);
+        self.s.m.terminate(retry, Term::CondBr(success, done, retry));
+        self.cur = done;
+        old
+    }
+
+    /// AMD RDNA 2 ISA sections 12.13–12.14 (including DS_WRAP).
+    fn atomic_new_value(&mut self, op: AtomicUpdate, old: V, data: V, data2: V) -> V {
+        use AtomicUpdate::*;
+        let c = self.cur;
+        let ty = self.s.m.type_of(old);
+        let zero = self.s.m.int_const(ty, 0);
+        let one = self.s.m.int_const(ty, 1);
+        match op {
+            Inc => {
+                let wrap = self.s.m.cmp(c, pred::IUGE, old, data);
+                let next = self.s.m.bin(c, Bin::Add, old, one);
+                self.s.m.select(c, wrap, zero, next)
+            }
+            Dec => {
+                let at_zero = self.s.m.cmp(c, pred::EQ, old, zero);
+                let above = self.s.m.cmp(c, pred::IUGT, old, data);
+                let wrap = self.s.m.bin(c, Bin::Or, at_zero, above);
+                let next = self.s.m.bin(c, Bin::Sub, old, one);
+                self.s.m.select(c, wrap, data, next)
+            }
+            ReverseSub => self.s.m.bin(c, Bin::Sub, data, old),
+            MaskOr => {
+                let ones = self.s.m.int_const(ty, -1);
+                let keep = self.s.m.bin(c, Bin::Xor, data, ones);
+                let kept = self.s.m.bin(c, Bin::And, old, keep);
+                self.s.m.bin(c, Bin::Or, kept, data2)
+            }
+            Wrap => {
+                let wrap = self.s.m.cmp(c, pred::IUGE, old, data);
+                let low = self.s.m.bin(c, Bin::Sub, old, data);
+                let high = self.s.m.bin(c, Bin::Add, old, data2);
+                self.s.m.select(c, wrap, low, high)
+            }
+            ClampSub => {
+                let underflow = self.s.m.cmp(c, pred::IULT, old, data);
+                let diff = self.s.m.bin(c, Bin::Sub, old, data);
+                self.s.m.select(c, underflow, zero, diff)
+            }
+        }
+    }
+
+    fn byte_shift(&mut self, address: V) -> V {
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(self.cur, Bin::And, address, three);
+        self.s.m.bin(self.cur, Bin::Shl, byte, three)
+    }
+
+    fn write_subword_result(
+        &mut self,
+        inst: &Inst,
+        reg: u8,
+        x: V,
+        half: Option<u32>,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let reg = Reg::V(reg);
+        let x = if let Some(shift) = half {
+            let old = self.i32_of(inst.read(reg).ok_or("a D16 load's previous register value")?)?;
+            let c = self.cur;
+            let (mask, keep, at) = (
+                self.s.m.i32(0xFFFF),
+                self.s.m.i32(!(0xFFFF << shift)),
+                self.s.m.i32(shift),
+            );
+            let field = self.s.m.bin(c, Bin::And, x, mask);
+            let field = self.s.m.bin(c, Bin::Shl, field, at);
+            let old = self.s.m.bin(c, Bin::And, old, keep);
+            self.s.m.bin(c, Bin::Or, old, field)
+        } else {
+            x
+        };
+        self.write(inst, reg, x, guard);
+        Ok(())
+    }
+
+    /// Loads a byte field via aligned dword accesses. A half starting at
+    /// byte 3 reads the first byte of the next dword.
+    fn read_subword(
+        &mut self,
+        address: V,
+        width: u32,
+        signed: bool,
+        dword: impl Fn(&mut Self, V) -> Result<V, Why>,
+    ) -> Result<V, Why> {
+        let c = self.cur;
+        let shift = self.byte_shift(address);
+        let not3 = self.s.m.i32(!3);
+        let aligned = self.s.m.bin(c, Bin::And, address, not3);
+        let w = dword(self, aligned)?;
+        let low = self.s.m.bin(c, Bin::LShr, w, shift);
+        let x = if width == 16 {
+            let k24 = self.s.m.i32(24);
+            let split = self.s.m.cmp(c, pred::EQ, shift, k24);
+            let at = self.begin_guarded(Some(split));
+            let four = self.s.m.i32(4);
+            let next = self.s.m.bin(self.cur, Bin::Add, aligned, four);
+            let high = dword(self, next)?;
+            let eight = self.s.m.i32(8);
+            let high = self.s.m.bin(self.cur, Bin::Shl, high, eight);
+            let both = self.s.m.bin(self.cur, Bin::Or, low, high);
+            self.end_guarded(at, &[(both, low)])[0]
+        } else {
+            low
+        };
+        let left = self.s.m.i32(32 - width);
+        let x = self.s.m.bin(self.cur, Bin::Shl, x, left);
+        Ok(self.s.m.bin(self.cur, if signed { Bin::AShr } else { Bin::LShr }, x, left))
+    }
+
+    /// Masks the affected bytes in each dword. A CAS keeps concurrent
+    /// writes to other bytes in the same dword from being lost.
+    fn write_subword(
+        &mut self,
+        address: V,
+        width: u32,
+        data: V,
+        store: impl Fn(&mut Self, V, V, V),
+    ) {
+        let c = self.cur;
+        let shift = self.byte_shift(address);
+        let not3 = self.s.m.i32(!3);
+        let aligned = self.s.m.bin(c, Bin::And, address, not3);
+        let mask = self.s.m.i32((1 << width) - 1);
+        let data = self.s.m.bin(c, Bin::And, data, mask);
+        let bits = self.s.m.bin(c, Bin::Shl, data, shift);
+        let mask = self.s.m.bin(c, Bin::Shl, mask, shift);
+        store(self, aligned, mask, bits);
+        if width == 16 {
+            let c = self.cur;
+            let k24 = self.s.m.i32(24);
+            let split = self.s.m.cmp(c, pred::EQ, shift, k24);
+            let at = self.begin_guarded(Some(split));
+            let four = self.s.m.i32(4);
+            let next = self.s.m.bin(self.cur, Bin::Add, aligned, four);
+            let (eight, byte_mask) = (self.s.m.i32(8), self.s.m.i32(255));
+            let bits = self.s.m.bin(self.cur, Bin::LShr, data, eight);
+            store(self, next, byte_mask, bits);
+            self.end_guarded(at, &[]);
+        }
+    }
+
+    fn lds_in_bounds(&mut self, byte: V, wide: bool) -> V {
+        let c = self.cur;
+        let shift = self.s.m.i32(if wide { 3 } else { 2 });
+        let index = self.s.m.bin(c, Bin::LShr, byte, shift);
+        let limit = self.s.m.i32(if wide {
+            self.s.lds_dwords / 2
+        } else {
+            self.s.lds_dwords
+        });
+        self.s.m.cmp(c, pred::IULT, index, limit)
+    }
+
+    fn lds_ptr(&mut self, byte: V) -> V {
+        let shift = self.s.m.i32(if self.wide_lds { 3 } else { 2 });
+        let index = self.s.m.bin(self.cur, Bin::LShr, byte, shift);
+        let lds = self.s.lds(self.wide_lds);
+        self.s.m.element(self.cur, lds, index)
+    }
+
+    // DXIL forbids reinterpreting TGSM through a differently sized pointer.
+    // When a shader needs i64 atomics, every access uses the same i64 array.
+    fn lds_half_shift(&mut self, byte: V) -> V {
+        let (four, eight) = (self.s.m.i32(4), self.s.m.i32(8));
+        let half = self.s.m.bin(self.cur, Bin::And, byte, four);
+        let shift = self.s.m.bin(self.cur, Bin::Mul, half, eight);
+        let ty = self.s.m.int(64);
+        self.s.m.cast(self.cur, Cast::ZExt, shift, ty)
+    }
+
+    fn lds_load_dword(&mut self, byte: V) -> V {
+        let in_bounds = self.lds_in_bounds(byte, false);
+        if self.wide_lds {
+            let at = self.begin_guarded(Some(in_bounds));
+            let p = self.lds_ptr(byte);
+            let ty = self.s.m.int(64);
+            let zero = self.s.m.int_const(ty, 0);
+            // Atomic access avoids racing with a lane using the other half.
+            let pair = self.s.m.atomic(self.cur, Rmw::Or, p, zero);
+            let shift = self.lds_half_shift(byte);
+            let x = self.s.m.bin(self.cur, Bin::LShr, pair, shift);
+            let x = self.s.m.cast(self.cur, Cast::Trunc, x, self.s.t.i32);
+            let zero = self.s.m.i32(0);
+            return self.end_guarded(at, &[(x, zero)])[0];
+        }
+        let c = self.cur;
+        let two = self.s.m.i32(2);
+        let index = self.s.m.bin(c, Bin::LShr, byte, two);
+        let zero = self.s.m.i32(0);
+        let safe = self.s.m.select(c, in_bounds, index, zero);
+        let lds = self.s.lds(false);
+        let p = self.s.m.element(c, lds, safe);
+        let loaded = self.s.m.load(c, p);
+        self.s.m.select(c, in_bounds, loaded, zero)
+    }
+
+    fn lds_update_dword(&mut self, byte: V, update: impl FnOnce(&mut Self, V) -> V) -> V {
+        let p = self.lds_ptr(byte);
+        let zero = if self.wide_lds {
+            let ty = self.s.m.int(64);
+            self.s.m.int_const(ty, 0)
+        } else {
+            self.s.m.i32(0)
+        };
+        let shift = self.wide_lds.then(|| self.lds_half_shift(byte));
+        let mut result = None;
+        self.atomic_update(zero, |l, old| {
+            let c = l.cur;
+            let field = if let Some(shift) = shift {
+                let field = l.s.m.bin(c, Bin::LShr, old, shift);
+                l.s.m.cast(c, Cast::Trunc, field, l.s.t.i32)
+            } else {
+                old
+            };
+            result = Some(field);
+            let next = update(l, field);
+            let next = if let Some(shift) = shift {
+                let ty = l.s.m.int(64);
+                let next = l.s.m.cast(c, Cast::ZExt, next, ty);
+                let next = l.s.m.bin(c, Bin::Shl, next, shift);
+                let mask = l.s.m.int_const(ty, i64::from(u32::MAX));
+                let mask = l.s.m.bin(c, Bin::Shl, mask, shift);
+                l.atomic_new_value(AtomicUpdate::MaskOr, old, mask, next)
+            } else {
+                next
+            };
+            l.s.m.cmpxchg(c, p, old, next)
+        });
+        result.expect("the compare-exchange body was emitted")
+    }
+
+    fn lds_store_dword(&mut self, byte: V, data: V) {
+        let in_bounds = self.lds_in_bounds(byte, false);
+        let at = self.begin_guarded(Some(in_bounds));
+        if self.wide_lds {
+            self.lds_update_dword(byte, |_, _| data);
+        } else {
+            let p = self.lds_ptr(byte);
+            self.s.m.store(self.cur, p, data);
+        }
+        self.end_guarded(at, &[]);
+    }
+
+    fn join64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let ty = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, ty);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, ty);
+        let k32 = self.s.m.int_const(ty, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
+    }
+
+    fn atomic_data(&mut self, inst: &Inst, data: &Operand, wide: bool) -> Result<V, Why> {
+        let words = self.vgprs(inst, data, if wide { 2 } else { 1 })?;
+        Ok(if wide { self.join64(words[0], words[1]) } else { words[0] })
+    }
+
     /// Code that depends on the lane layout: wave operations, and in compute
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
@@ -2838,26 +3145,18 @@ impl<'a> Lower<'a> {
         use super::bitcode::Rmw;
         let c = self.cur;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-        // Out-of-bounds reads clamp to dword 0 and yield 0; OOB writes drop.
+        // Out-of-bounds reads clamp and yield 0; OOB writes drop.
         // A halfword is taken as 2-aligned (the bytes never straddle two dwords).
         let o = k(self, offset);
         let at = self.s.m.bin(c, Bin::Add, a, o);
-        let two = k(self, 2);
-        let index = self.s.m.bin(c, Bin::LShr, at, two);
-        let limit = k(self, self.s.lds_dwords);
-        let in_bounds = self.s.m.cmp(c, pred::IULT, index, limit);
-        let zero = k(self, 0);
-        let safe = self.s.m.select(c, in_bounds, index, zero);
-        let lds = self.s.lds();
-        let p = self.s.m.element(c, lds, safe);
         let three = k(self, 3);
         let byte = self.s.m.bin(c, Bin::And, at, three);
         let shift = self.s.m.bin(c, Bin::Shl, byte, three);
         let mask = k(self, (1 << sub.bits) - 1);
         if !sub.write {
             let reg = dst_reg.ok_or("an LDS read result")?;
-            let x = self.s.m.load(c, p);
-            let x = self.s.m.select(c, in_bounds, x, zero);
+            let x = self.lds_load_dword(at);
+            let c = self.cur;
             let x = self.s.m.bin(c, Bin::LShr, x, shift);
             let x = if sub.signed {
                 let up = k(self, 32 - sub.bits);
@@ -2904,16 +3203,23 @@ impl<'a> Lower<'a> {
         // the bytes go in atomically: cleared, then set. shortcut: lanes
         // writing the same bytes at once leave both values or-ed together
         // where the console keeps one of them.
+        let in_bounds = self.lds_in_bounds(at, false);
         let write_guard = match guard {
-            Some(g) => Some(self.s.m.bin(c, Bin::And, g, in_bounds)),
+            Some(g) => Some(self.s.m.bin(self.cur, Bin::And, g, in_bounds)),
             None => Some(in_bounds),
         };
-        let at = self.begin_guarded(write_guard);
-        let lds = self.s.lds();
-        let p = self.s.m.element(self.cur, lds, safe);
-        self.s.m.atomic(self.cur, Rmw::And, p, clear);
-        self.s.m.atomic(self.cur, Rmw::Or, p, set);
-        self.end_guarded(at, &[]);
+        let guarded = self.begin_guarded(write_guard);
+        if self.wide_lds {
+            self.lds_update_dword(at, |l, old| {
+                let kept = l.s.m.bin(l.cur, Bin::And, old, clear);
+                l.s.m.bin(l.cur, Bin::Or, kept, set)
+            });
+        } else {
+            let p = self.lds_ptr(at);
+            self.s.m.atomic(self.cur, Rmw::And, p, clear);
+            self.s.m.atomic(self.cur, Rmw::Or, p, set);
+        }
+        self.end_guarded(guarded, &[]);
         Ok(())
     }
 
@@ -2934,6 +3240,9 @@ impl<'a> Lower<'a> {
             return Err("GDS");
         }
         let name = inst.name();
+        if name == "ds_nop" {
+            return Ok(());
+        }
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
@@ -2986,22 +3295,23 @@ impl<'a> Lower<'a> {
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
+        if name.contains("addtid") {
+            return Err("an LDS address based on the console lane ID and M0");
+        }
+        if name.contains("_src2_") {
+            return Err("an LDS operation with a second memory source");
+        }
+        if name.starts_with("ds_gws") || matches!(name, "ds_append" | "ds_consume" | "ds_ordered_count") {
+            return Err("an LDS or GDS queue or global wave synchronization operation");
+        }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // Out-of-bounds console LDS accesses read 0 and drop writes; clamping
-        // read indices also keeps inactive lanes with garbage VGPRs in bounds.
-        let index_and_bounds = |l: &mut Self, bytes: u32| -> (V, V) {
-            let c = l.cur;
-            let at = if bytes == 0 {
+        let byte = |l: &mut Self, bytes: u32| {
+            if bytes == 0 {
                 a
             } else {
                 let o = l.s.m.i32(bytes);
-                l.s.m.bin(c, Bin::Add, a, o)
-            };
-            let two = l.s.m.i32(2);
-            let index = l.s.m.bin(c, Bin::LShr, at, two);
-            let limit = l.s.m.i32(l.s.lds_dwords);
-            let in_bounds = l.s.m.cmp(c, pred::IULT, index, limit);
-            (index, in_bounds)
+                l.s.m.bin(l.cur, Bin::Add, a, o)
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -3023,6 +3333,7 @@ impl<'a> Lower<'a> {
             return self.ds_sub_dword(inst, sub, a, offset, dst_reg, data, guard);
         }
         if let Some(rest) = name.strip_prefix("ds_read") {
+            let reg = dst_reg.ok_or("an LDS read result")?;
             let elements = if rest.starts_with('2') {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
@@ -3030,18 +3341,11 @@ impl<'a> Lower<'a> {
             } else {
                 return Err("an LDS read of bytes or halves");
             };
-            let reg = dst_reg.ok_or("an LDS read result")?;
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let (index, in_bounds) = index_and_bounds(self, off + 4 * k);
-                    let c = self.cur;
-                    let zero = self.s.m.i32(0);
-                    let safe = self.s.m.select(c, in_bounds, index, zero);
-                    let lds = self.s.lds();
-                    let p = self.s.m.element(c, lds, safe);
-                    let loaded = self.s.m.load(c, p);
-                    let x = self.s.m.select(c, in_bounds, loaded, zero);
+                    let address = byte(self, off + 4 * k);
+                    let x = self.lds_load_dword(address);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -3063,88 +3367,159 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            if let [(off, x)] = stores[..] {
-                let (index, in_bounds) = index_and_bounds(self, off);
-                let cond = match guard {
-                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_bounds),
-                    None => in_bounds,
-                };
-                let at = self.begin_guarded(Some(cond));
-                let lds = self.s.lds();
-                let p = self.s.m.element(self.cur, lds, index);
-                self.s.m.store(self.cur, p, x);
-                self.end_guarded(at, &[]);
-            } else {
-                let outer = self.begin_guarded(guard);
-                for (off, x) in stores {
-                    let (index, in_bounds) = index_and_bounds(self, off);
-                    let inner = self.begin_guarded(Some(in_bounds));
-                    let lds = self.s.lds();
-                    let p = self.s.m.element(self.cur, lds, index);
-                    self.s.m.store(self.cur, p, x);
-                    self.end_guarded(inner, &[]);
-                }
-                self.end_guarded(outer, &[]);
+            let at = self.begin_guarded(guard);
+            for (off, x) in stores {
+                let address = byte(self, off);
+                self.lds_store_dword(address, x);
             }
+            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
-        let op = name
-            .strip_prefix("ds_")
-            .map(|n| n.replace("_rtn", ""))
-            .ok_or("an LDS operation")?;
-        use super::bitcode::Rmw;
-        let rmw = match op.as_str() {
-            "add_u32" => Some(Rmw::Add),
-            "sub_u32" => Some(Rmw::Sub),
-            "and_b32" => Some(Rmw::And),
-            "or_b32" => Some(Rmw::Or),
-            "xor_b32" => Some(Rmw::Xor),
-            "min_i32" => Some(Rmw::Min),
-            "max_i32" => Some(Rmw::Max),
-            "min_u32" => Some(Rmw::UMin),
-            "max_u32" => Some(Rmw::UMax),
-            "wrxchg_b32" => Some(Rmw::Xchg),
-            "cmpst_b32" => None,
+        if name.ends_with("_f32") || name.ends_with("_f64") {
+            // Mesa's aco_insert_fp_mode.cpp tracks the applicable MODE
+            // denormal bits for these. NativeProgram does not carry them.
+            return Err("an LDS floating-point atomic requiring the console's denormal mode");
+        }
+        if name.starts_with("ds_condxchg32") {
+            return Err("an LDS conditional exchange with undocumented compare operands");
+        }
+        let (op, wide, kind) = ds_integer_atomic(name).ok_or("an LDS operation")?;
+        if matches!(op, "wrxchg2" | "wrxchg2st64") {
+            // AMD RDNA 2 ISA §12.13 specifies separate exchanges at the
+            // two addresses. It does not specify their order if they alias.
+            if offset0 == offset1 {
+                return Err("an LDS paired exchange with coincident addresses");
+            }
+            let reg = dst_reg.ok_or("an LDS exchange result")?;
+            let d0 = self.atomic_data(inst, data.first().ok_or("LDS exchange data")?, wide)?;
+            let d1 = self.atomic_data(inst, data.get(1).ok_or("LDS exchange data")?, wide)?;
+            let ty = self.s.m.type_of(d0);
+            let zero = self.s.m.int_const(ty, 0);
+            let at = self.begin_guarded(guard);
+            let mut old = Vec::new();
+            for ((off, _), data) in pair(name).into_iter().zip([d0, d1]) {
+                let address = byte(self, off);
+                let in_bounds = self.lds_in_bounds(address, wide);
+                let inner = self.begin_guarded(Some(in_bounds));
+                let x = if !wide && self.wide_lds {
+                    self.lds_update_dword(address, |_, _| data)
+                } else {
+                    let p = self.lds_ptr(address);
+                    self.s.m.atomic(self.cur, Rmw::Xchg, p, data)
+                };
+                let x = self.end_guarded(inner, &[(x, zero)])[0];
+                old.push((x, zero));
+            }
+            if self.wide_lds {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_GROUP_SHARED;
+            }
+            let words = if wide { 2 } else { 1 };
+            for (k, x) in self.end_guarded(at, &old).into_iter().enumerate() {
+                self.write_atomic_result(inst, reg + k as u8 * words, x, wide, guard);
+            }
+            return Ok(());
+        }
+        let rmw = match (op, kind) {
+            ("add" | "sub", _) => Some(Rmw::Add),
+            ("and", _) => Some(Rmw::And),
+            ("or", _) => Some(Rmw::Or),
+            ("xor", _) => Some(Rmw::Xor),
+            ("min", b'i') => Some(Rmw::Min),
+            ("max", b'i') => Some(Rmw::Max),
+            ("min", _) => Some(Rmw::UMin),
+            ("max", _) => Some(Rmw::UMax),
+            ("wrxchg", _) => Some(Rmw::Xchg),
+            _ => None,
+        };
+        let update = match op {
+            "rsub" => Some(AtomicUpdate::ReverseSub),
+            "inc" => Some(AtomicUpdate::Inc),
+            "dec" => Some(AtomicUpdate::Dec),
+            "mskor" => Some(AtomicUpdate::MaskOr),
+            "wrap" => Some(AtomicUpdate::Wrap),
+            _ if rmw.is_some() || op == "cmpst" => None,
             _ => return Err("an LDS operation"),
         };
-        let v0 = self.vgprs(inst, data.first().ok_or("an LDS atomic")?, 1)?[0];
-        let v1 = match data.get(1) {
-            Some(d) => Some(self.vgprs(inst, d, 1)?[0]),
-            None => None,
+        let v0 = self.atomic_data(inst, data.first().ok_or("LDS atomic data")?, wide)?;
+        let ty = self.s.m.type_of(v0);
+        let zero = self.s.m.int_const(ty, 0);
+        let v1 = if matches!(op, "mskor" | "wrap" | "cmpst") {
+            self.atomic_data(inst, data.get(1).ok_or("a second LDS atomic operand")?, wide)?
+        } else {
+            zero
         };
-        let old_reg = dst_reg.and_then(|r| inst.read(Reg::V(r)).map(|v| (r, v)));
-        let outside = match old_reg {
-            Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
-            None => self.s.m.i32(0),
-        };
-        let (index, in_bounds) = index_and_bounds(self, offset);
-        let c = self.cur;
-        let zero = self.s.m.i32(0);
-        let fallback = match guard {
-            Some(g) => self.s.m.select(c, g, zero, outside),
-            None => zero,
-        };
+        let address = byte(self, offset);
+        let in_bounds = self.lds_in_bounds(address, wide);
         let cond = match guard {
-            Some(g) => self.s.m.bin(c, Bin::And, g, in_bounds),
+            Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_bounds),
             None => in_bounds,
         };
         let at = self.begin_guarded(Some(cond));
-        let lds = self.s.lds();
-        let p = self.s.m.element(self.cur, lds, index);
-        let r = match rmw {
-            Some(op) => self.s.m.atomic(self.cur, op, p, v0),
+        if wide || self.wide_lds {
+            self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_GROUP_SHARED;
+        }
+        let r = if !wide && self.wide_lds {
+            self.lds_update_dword(address, |l, old| {
+                if let Some(update) = update {
+                    return l.atomic_new_value(update, old, v0, v1);
+                }
+                let c = l.cur;
+                match op {
+                    "add" => l.s.m.bin(c, Bin::Add, old, v0),
+                    "sub" => l.s.m.bin(c, Bin::Sub, old, v0),
+                    "and" => l.s.m.bin(c, Bin::And, old, v0),
+                    "or" => l.s.m.bin(c, Bin::Or, old, v0),
+                    "xor" => l.s.m.bin(c, Bin::Xor, old, v0),
+                    "wrxchg" => v0,
+                    "cmpst" => {
+                        let same = l.s.m.cmp(c, pred::EQ, old, v0);
+                        l.s.m.select(c, same, v1, old)
+                    }
+                    _ => {
+                        let pred = match (op, kind) {
+                            ("min", b'i') => pred::SLT,
+                            ("max", b'i') => pred::SGT,
+                            ("min", _) => pred::IULT,
+                            ("max", _) => pred::IUGT,
+                            _ => unreachable!(),
+                        };
+                        let take = l.s.m.cmp(c, pred, v0, old);
+                        l.s.m.select(c, take, v0, old)
+                    }
+                }
+            })
+        } else if let Some(rmw) = rmw {
+            let p = self.lds_ptr(address);
+            // DXIL supports atomic add, with subtraction encoded as -DATA.
+            let data = if op == "sub" { self.s.m.bin(self.cur, Bin::Sub, zero, v0) } else { v0 };
+            self.s.m.atomic(self.cur, rmw, p, data)
+        } else if let Some(update) = update {
+            let p = self.lds_ptr(address);
+            self.atomic_update(zero, |l, old| {
+                let x = l.atomic_new_value(update, old, v0, v1);
+                l.s.m.cmpxchg(l.cur, p, old, x)
+            })
+        } else {
             // Compare with data0, store data1.
-            None => self
-                .s
-                .m
-                .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
+            let p = self.lds_ptr(address);
+            self.s.m.cmpxchg(self.cur, p, v0, v1)
         };
-        let r = self.end_guarded(at, &[(r, fallback)])[0];
+        let r = self.end_guarded(at, &[(r, zero)])[0];
         if let Some(reg) = dst_reg {
-            self.write(inst, Reg::V(reg), r, None);
+            self.write_atomic_result(inst, reg, r, wide, guard);
         }
         Ok(())
+    }
+
+    fn write_atomic_result(&mut self, inst: &Inst, reg: u8, old: V, wide: bool, guard: Option<V>) {
+        if wide {
+            let (lo, hi) = self.split64(old);
+            self.write(inst, Reg::V(reg), lo, guard);
+            self.write(inst, Reg::V(reg + 1), hi, guard);
+        } else {
+            self.write(inst, Reg::V(reg), old, guard);
+        }
     }
 
     // ---- instructions ----
@@ -3717,6 +4092,12 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if name.starts_with("s_scratch_") {
+            return Err("scalar access to the console scratch aperture");
+        }
+        if name.contains("_store_") {
+            return Err("a scalar store without root UAV address support");
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -7604,6 +7985,55 @@ impl<'a> Lower<'a> {
         })
     }
 
+    fn raw_dword(&mut self, h: V, coords: [V; 2]) -> V {
+        let c = self.cur;
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139,
+            &[h, coords[0], coords[1], mask, align]);
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
+    }
+
+    fn buffer_compare_exchange(&mut self, h: V, coords: [V; 3], old: V, new: V, wide: bool) -> V {
+        let name = if wide { "atomicCompareExchange.i64" } else { "atomicCompareExchange.i32" };
+        let ty = self.s.m.type_of(old);
+        self.s.op(self.cur, name, Attr::NoUnwind, ty, 79,
+            &[h, coords[0], coords[1], coords[2], old, new])
+    }
+
+    /// A CAS must run on a real lane and at an in-range address: outside
+    /// those cases DXIL can return an unspecified old value.
+    fn buffer_bounds(&mut self, h: V, index: Option<V>, off: V, stride: u32, size: u32) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let unused = self.s.m.undef(i32t);
+        let dimensions = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, unused]);
+        let length = self.s.m.extract(c, dimensions, 0);
+        if let Some(index) = index {
+            let record = self.s.m.cmp(c, pred::IULT, index, length);
+            let limit = self.s.m.i32(stride - (size - 1));
+            let member = self.s.m.cmp(c, pred::IULT, off, limit);
+            return self.s.m.bin(c, Bin::And, record, member);
+        }
+        let tail = self.s.m.i32(size - 1);
+        let last = self.s.m.bin(c, Bin::Add, off, tail);
+        let fits = self.s.m.cmp(c, pred::IULT, last, length);
+        let no_wrap = self.s.m.cmp(c, pred::IUGE, last, off);
+        self.s.m.bin(c, Bin::And, fits, no_wrap)
+    }
+
+    fn buffer_store_guard(&mut self, bounds: V, guard: Option<V>) -> V {
+        let c = self.cur;
+        let g = guard.map_or(bounds, |g| self.s.m.bin(c, Bin::And, g, bounds));
+        if !self.s.pixel {
+            return g;
+        }
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        let no = self.s.m.bool(false);
+        self.s.m.select(c, helper, no, g)
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -7625,17 +8055,23 @@ impl<'a> Lower<'a> {
             return Err("a buffer access to LDS or with tfe");
         }
         if format.is_some() && !name.starts_with("tbuffer_load_format_") {
-            return Err(name);
+            return Err("an MTBUF store requiring a packed-format write");
+        }
+        if name.contains("_format_d16_hi_") {
+            return Err("a typed buffer access to the high half with an untracked numeric format");
         }
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
+        let atomic = name.strip_prefix("buffer_atomic_");
+        let wide = atomic.is_some_and(|n| n.ends_with("_x2"));
+        let atomic = atomic.map(|n| n.strip_suffix("_x2").unwrap_or(n));
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
         // min and max, exchange; compare-exchange apart.
-        let atomic = match name.strip_prefix("buffer_atomic_") {
+        let native_atomic = match atomic {
             None => None,
-            Some("add") => Some(0),
+            Some("add" | "sub") => Some(0),
             Some("and") => Some(1),
             Some("or") => Some(2),
             Some("xor") => Some(3),
@@ -7644,8 +8080,18 @@ impl<'a> Lower<'a> {
             Some("umin") => Some(6),
             Some("umax") => Some(7),
             Some("swap") => Some(8),
-            Some("cmpswap") => Some(u32::MAX),
+            Some("cmpswap" | "inc" | "dec" | "csub") => None,
+            Some("fcmpswap" | "fmin" | "fmax") => {
+                // Mesa aco_insert_fp_mode.cpp, vmem_default_needs.
+                return Err("a buffer floating-point atomic requiring the console's denormal mode");
+            }
             Some(_) => return Err(name),
+        };
+        let sub_load = name.strip_prefix("buffer_load_").and_then(subword_load);
+        let sub_store = match name {
+            "buffer_store_byte" | "buffer_store_byte_d16_hi" => Some(8),
+            "buffer_store_short" | "buffer_store_short_d16_hi" => Some(16),
+            _ => None,
         };
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
@@ -7655,7 +8101,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || sub_load.is_some() || sub_store.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -7692,6 +8138,7 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        let stride = used.map_or(0, |u| u.stride);
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -7701,6 +8148,9 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+            if store || atomic.is_some() {
+                return Err("a write or atomic operation on a constant buffer");
+            }
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -7716,6 +8166,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            if let Some((width, signed, half)) = sub_load {
+                let x = self.read_subword(byte, width, signed, |l, at| Ok(l.cbuffer_dword(h, at)))?;
+                self.write_subword_result(inst, reg, x, half, guard)?;
+                return Ok(());
+            }
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
@@ -7727,14 +8182,70 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        if sub_load.is_some() || sub_store.is_some() {
+            let data = data.as_ref().ok_or("buffer sub-dword data")?;
+            let Operand::Vector { reg, .. } = *data else {
+                return Err("buffer sub-dword data");
+            };
+            let h = if index.is_some() {
+                if stride < 4 || !stride.is_multiple_of(4) {
+                    return Err("a structured sub-dword buffer access without a dword-aligned stride");
+                }
+                self.handle(site, src, false, (12 | u, stride))?
+            } else {
+                self.handle(site, src, false, (11 | u, 0))?
+            };
+            let coords = |byte| index.map_or([byte, iu], |i| [i, byte]);
+            if let Some((width, signed, half)) = sub_load {
+                // Root SRVs have no size in DXIL.
+                let bounds = (!matches!(src, Source::Built { .. }))
+                    .then(|| self.buffer_bounds(h, index, off, stride, width / 8));
+                let at = self.begin_guarded(bounds);
+                let x = self.read_subword(off, width, signed, |l, at| Ok(l.raw_dword(h, coords(at))))?;
+                let zero = self.s.m.i32(0);
+                let x = self.end_guarded(at, &[(x, zero)])[0];
+                self.write_subword_result(inst, reg, x, half, guard)?;
+            } else if let Some(width) = sub_store {
+                let mut x = self.vgprs(inst, data, 1)?[0];
+                if name.ends_with("_hi") {
+                    let sixteen = self.s.m.i32(16);
+                    x = self.s.m.bin(c, Bin::LShr, x, sixteen);
+                }
+                let bounds = self.buffer_bounds(h, index, off, stride, width / 8);
+                let active = self.buffer_store_guard(bounds, guard);
+                let at = self.begin_guarded(Some(active));
+                self.write_subword(off, width, x, |l, byte, mask, bits| {
+                    let [a, b] = coords(byte);
+                    let zero = l.s.m.i32(0);
+                    l.atomic_update(zero, |l, old| {
+                        let x = l.atomic_new_value(AtomicUpdate::MaskOr, old, mask, bits);
+                        l.buffer_compare_exchange(h, [a, b, iu], old, x, false)
+                    });
+                });
+                self.end_guarded(at, &[]);
+            }
+            return Ok(());
+        }
         if let Some(op) = atomic {
+            let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+            if op == "csub" && !returns {
+                // LLVM BUFInstructions.td only selects the returning form
+                // on GFX10.3.
+                return Err("buffer_atomic_csub without the required GLC bit");
+            }
             let d = data.as_ref().ok_or("buffer atomic data")?;
-            let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
+            let words = if wide { 2 } else { 1 };
+            let vals = self.vgprs(inst, d, if op == "cmpswap" { 2 * words } else { words })?;
+            let val = if wide { self.join64(vals[0], vals[1]) } else { vals[0] };
+            let ty = self.s.m.type_of(val);
+            let zero = self.s.m.int_const(ty, 0);
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
+                    }
+                    if wide && !stride.is_multiple_of(8) {
+                        return Err("a 64-bit buffer atomic without an eight-byte-aligned stride");
                     }
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
@@ -7744,36 +8255,43 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
-            let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if returns => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
-            };
-            let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
-            let r = if op == u32::MAX {
-                // cmpswap: data is (new, compare).
-                let mut args = vec![h];
-                args.extend(coords);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
-                    "atomicCompareExchange.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    79,
-                    &args,
-                )
+            if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_INT64_HEAP;
+            }
+            let active = if wide || matches!(op, "sub" | "inc" | "dec" | "csub") {
+                let bounds = self.buffer_bounds(h, index, off, stride, 4 * u32::from(words));
+                Some(self.buffer_store_guard(bounds, guard))
             } else {
-                let mut args = vec![h, self.s.m.i32(op)];
-                args.extend(coords);
-                args.push(vals[0]);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                guard
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            let at = self.begin_guarded(active);
+            let r = if op == "cmpswap" {
+                // cmpswap: data is (new, compare).
+                let compare = if wide { self.join64(vals[2], vals[3]) } else { vals[1] };
+                self.buffer_compare_exchange(h, coords, compare, val, wide)
+            } else if let Some(code) = native_atomic {
+                let name = if wide { "atomicBinOp.i64" } else { "atomicBinOp.i32" };
+                let code = self.s.m.i32(code);
+                let data = if op == "sub" { self.s.m.bin(self.cur, Bin::Sub, zero, val) } else { val };
+                self.s.op(self.cur, name, Attr::NoUnwind, ty, 78,
+                    &[h, code, coords[0], coords[1], coords[2], data])
+            } else {
+                let update = match op {
+                    "inc" => AtomicUpdate::Inc,
+                    "dec" => AtomicUpdate::Dec,
+                    "csub" => AtomicUpdate::ClampSub,
+                    _ => unreachable!(),
+                };
+                self.atomic_update(zero, |l, old| {
+                    let x = l.atomic_new_value(update, old, val, zero);
+                    l.buffer_compare_exchange(h, coords, old, x, wide)
+                })
+            };
             if returns {
-                self.write(inst, Reg::V(reg), r, None);
+                let r = self.end_guarded(at, &[(r, zero)])[0];
+                self.write_atomic_result(inst, reg, r, wide, guard);
+            } else {
+                self.end_guarded(at, &[]);
             }
             return Ok(());
         }
@@ -7803,7 +8321,7 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write channels of a float
                 // format.
-                if *offen || *offset != 0 {
+                if *offen || *offset != 0 || matches!(off, V::Inst(_)) {
                     return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
@@ -7844,7 +8362,7 @@ impl<'a> Lower<'a> {
         }
         if let Some(f) = *format {
             if index.is_some() {
-                return Err("a typed-format load by index");
+                return Err("an indexed MTBUF load requiring a raw view of a structured descriptor");
             }
             let h = self.handle(site, src, false, (11 | u, 0))?;
             let Some(Operand::Vector { reg, .. }) = *data else {
