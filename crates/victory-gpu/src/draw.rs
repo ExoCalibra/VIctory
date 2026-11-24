@@ -747,7 +747,7 @@ impl State {
         else {
             return;
         };
-        self.dynamic.push((heap_id, slot, 1));
+        self.lease.add(heap_id, slot, 1);
         self.bind_heaps(list);
         crate::list::ensure_state(list, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
         // SAFETY: matched views, a live texture in UAV state, and the
@@ -1297,11 +1297,70 @@ impl State {
                 fresh.push(u.slot);
             }
         }
+        // Root-selected entries beyond a capped host heap also require a fresh table.
+        for idx in indexed {
+            if fresh.contains(&idx.table_slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(idx.table_slot))
+            else {
+                continue;
+            };
+            let constant = self.user_value(
+                compute,
+                idx.constant_slot,
+                RootType::Constants,
+                idx.constant_dword,
+            );
+            let slot_off = idx.byte_offset.wrapping_add(constant << idx.shift) / 32;
+            let handle = table + u64::from(slot_off) * 32;
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+                continue;
+            };
+            if index >= host.count() {
+                fresh.push(idx.table_slot);
+            }
+        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
+            }
+        }
+        // Mirror root-selected entries for tables that stayed in place.
+        for idx in indexed {
+            if fresh.contains(&idx.table_slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(idx.table_slot))
+            else {
+                continue;
+            };
+            let constant = self.user_value(
+                compute,
+                idx.constant_slot,
+                RootType::Constants,
+                idx.constant_dword,
+            );
+            let slot_off = idx.byte_offset.wrapping_add(constant << idx.shift) / 32;
+            let handle = table + u64::from(slot_off) * 32;
+            let Some(heap) = self.heap_of(handle) else {
+                continue;
+            };
+            let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+                continue;
+            };
+            if let Some(view) = host.mirror(index, handle, true) {
+                let kind = match view {
+                    View::Constant(..) => ResourceType::Cbv,
+                    View::Unordered(..) | View::Placed(true, ..) => ResourceType::Uav,
+                    _ => ResourceType::Srv,
+                };
+                self.depth_sampled |= readable(list, kind, &view, read_only_depth);
             }
         }
         let mut made = Vec::new();
@@ -2474,27 +2533,6 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
     let stride = u64::from(stride);
     let end = (u64::from(first) + u64::from(count)).checked_mul(stride)?;
     (stride != 0 && end <= u64::from(size)).then(|| u64::from(first) * stride)
-}
-
-/// Fixed-function state, straight onto the host list.
-pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetViewports(viewports) };
-}
-
-pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
-    // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
-}
-
-pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetBlendFactor(factor) };
-}
-
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetStencilRef(reference) };
 }
 
 /// Fixed-function state, straight onto the host list.

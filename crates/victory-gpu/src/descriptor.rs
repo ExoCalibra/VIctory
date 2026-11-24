@@ -1033,9 +1033,12 @@ mod tests {
         for address in bases {
             crate::shadow::register(address as usize, address, 256);
         }
+        // Offset by 16 bytes (valid on console, misaligned for PC 256-byte CBV)
+        // so the table exercises the fresh-table rebuild path with root-indexed views.
+        let cbv_addr = bases[0] + 16;
         create_cbv(
             std::ptr::null(),
-            &[bases[0] as u32, (bases[0] >> 32) as u32, 256, 0],
+            &[cbv_addr as u32, (cbv_addr >> 32) as u32, 240, 0],
             heap.start + 32,
         );
         let mut resource = [0u32; 14];

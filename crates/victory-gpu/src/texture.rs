@@ -318,7 +318,7 @@ impl Staging {
     fn refresh_now(&self) -> (usize, bool) {
         let size = self.layout.size as usize;
         if size == 0 {
-            return 0;
+            return (0, false);
         }
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -1089,16 +1089,23 @@ mod tests {
         let Some(host) = Host::new_warp() else {
             return;
         };
-        let (copy, _) = make_rgba_texture(&host, 4, 4);
-        let fake_resource = 0x1234_5678usize as This;
-        host_written(fake_resource);
+        let mut backing = vec![0u8; 64 << 10];
+        let tex = crate::resource::test_texture_at(
+            backing.as_mut_ptr() as u64,
+            4,
+            4,
+            28,
+            0x1, // ALLOW_RENDER_TARGET
+        );
+        let native = crate::resource::host_resource(tex).expect("host texture");
         let list = host.new_list().expect("new list");
-        upload(&list, fake_resource, &copy.texture);
+        host_written(&list, tex);
+        upload(&list, tex, native);
         assert!(
             !list.has_deferred_work(),
             "host-written textures must not queue CPU-to-GPU uploads"
         );
-        forget(fake_resource as usize);
+        crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10)(tex);
     }
 }
 
@@ -1183,7 +1190,7 @@ mod widened_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod host_written_tests {
     use super::*;
     use crate::object::{HRESULT, S_OK, guid, slot};
     use crate::resource::{
@@ -1797,7 +1804,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod residency_tests {
     use super::*;
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
     use windows_sys::Win32::System::Memory::{
@@ -2164,7 +2171,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod footprint_tests {
     use super::*;
 
     #[test]

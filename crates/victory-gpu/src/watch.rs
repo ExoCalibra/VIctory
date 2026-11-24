@@ -801,6 +801,13 @@ mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        // Earlier tests in the same process may have used and freed this VA.
+        let first = p / PAGE;
+        JOURNAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .written
+            .retain(|&page, _| !(first..first + pages).contains(&page));
         p
     }
 

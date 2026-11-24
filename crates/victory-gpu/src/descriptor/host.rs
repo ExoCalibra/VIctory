@@ -605,7 +605,9 @@ impl HostHeap {
         words: Option<&[u32; 10]>,
     ) -> Option<(u32, D3D12_GPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)> {
         let mut desc = words.map(uav_desc);
-        if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+        // SAFETY: a live host texture.
+        let info = unsafe { texture.GetDesc() };
+        if !fits(&info, desc.as_mut().map(|d| &mut d.Format), true) {
             return None;
         }
         let device = &host()?.device;
@@ -3097,12 +3099,12 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         // Explicit `_SRGB` SRV format is preserved rather than forced linear.
         let mut srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        assert!(fits(tex, Some(&mut srgb), false));
+        assert!(fits(&tex_desc, Some(&mut srgb), false));
         assert_eq!(srgb, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
 
         // UAV maps `_SRGB` to its linear UNORM twin as D3D12 requires.
         let mut uav_fmt = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        assert!(fits(tex, Some(&mut uav_fmt), true));
+        assert!(fits(&tex_desc, Some(&mut uav_fmt), true));
         assert_eq!(uav_fmt, DXGI_FORMAT_R8G8B8A8_UNORM);
 
         // Build real host descriptors for explicit `_SRGB` SRV, null-desc SRV,
