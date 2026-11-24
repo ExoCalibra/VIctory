@@ -208,6 +208,7 @@ fn run(period: Duration) {
         SymSetOptions(0x2 | 0x4); // SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS
         SymInitialize(GetCurrentProcess(), std::ptr::null(), 1);
     }
+    // SAFETY: plain call on the current thread.
     let me = unsafe { GetCurrentThreadId() };
     let mut threads: HashMap<u32, Tracked> = HashMap::new();
     let mut cache = HashMap::new();
@@ -260,7 +261,7 @@ fn run(period: Duration) {
             }
         }
         for t in threads.values_mut() {
-            if t.cpu_ms_second < BUSY_MS && tick % 25 != 0 {
+            if t.cpu_ms_second < BUSY_MS && !tick.is_multiple_of(25) {
                 continue;
             }
             if let Some(stack) = capture(t.handle) {
