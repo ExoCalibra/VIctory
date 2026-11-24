@@ -365,10 +365,7 @@ fn emit_program(
     // when the HLSL group fills its waves (Grand Theft Auto VI's do).
     let mesh_stride = match &native.io {
         crate::native::StageIo::Ms(ms) => {
-            let psv = c.part(FourCC::PSV0).map(|p| p.data);
-            let threads = psv
-                .filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 48))
-                .and_then(|d| crate::dxbc::u32_at(d, 4 + 36).ok());
+            let threads = mesh_group_threads(c.part(FourCC::PSV0).map(|p| p.data))?;
             threads.map_or(ms.threads, |t| {
                 t.max(ms.max_vertices).max(ms.max_primitives)
             })
@@ -453,6 +450,35 @@ fn psv_interp(part: &[u8], pixel: bool) -> Option<Vec<(Option<u32>, u8, u8, u8)>
         out.push((row, col, e[11], e[13]));
     }
     Some(out)
+}
+
+/// `D3D12_MS_THREAD_GROUP_MAX_THREAD_COUNT`: a mesh group's `numthreads`.
+const MESH_GROUP_THREADS: u32 = 128;
+
+/// The threads of a mesh program's HLSL group, from `PSV0` runtime info
+/// version 2 on (`None` before it): `NumThreadsX * Y * Z`.
+///
+/// The group id arrives multiplied by the whole group's thread count, so a
+/// `numthreads(8, 8, 1)` group strides by 64. Reading `NumThreadsX` alone
+/// strode by 8 and gave groups ids that overlap. The three sizes are raw
+/// `u32`s of the title's part; a group D3D12 cannot run (an empty axis, or
+/// more than 128 threads) is refused rather than multiplied.
+fn mesh_group_threads(psv: Option<&[u8]>) -> Result<Option<u32>, ShaderError> {
+    use crate::dxbc::u32_at;
+    let Some(d) = psv.filter(|d| u32_at(d, 0).is_ok_and(|n| n >= 48)) else {
+        return Ok(None);
+    };
+    let mut total = 1u32;
+    for k in 0..3 {
+        let n = u32_at(d, 4 + 36 + 4 * k)?;
+        total = total
+            .checked_mul(n)
+            .filter(|&t| n != 0 && t <= MESH_GROUP_THREADS)
+            .ok_or(ShaderError::Malformed(
+                "a mesh thread group past D3D12's limits",
+            ))?;
+    }
+    Ok(Some(total))
 }
 
 /// The native binding map gives a register but no space. Require every
@@ -641,6 +667,62 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    /// A `PSV0` part with runtime info version 2: `[x, y, z]` at 36.
+    fn psv_with_group(size: u32, [x, y, z]: [u32; 3]) -> Vec<u8> {
+        let mut d = size.to_le_bytes().to_vec();
+        d.resize(4 + 36, 0);
+        for n in [x, y, z] {
+            d.extend(n.to_le_bytes());
+        }
+        d
+    }
+
+    /// A mesh group id strides by the HLSL group's whole thread count, not
+    /// its x size alone: `numthreads(8, 8, 1)` is 64 threads. A group
+    /// D3D12 cannot run is refused before its sizes are multiplied.
+    #[test]
+    fn a_mesh_group_counts_every_axis() {
+        for (group, threads) in [
+            ([32, 1, 1], 32),
+            ([8, 8, 1], 64),
+            ([4, 4, 8], 128),
+            ([1, 1, 128], 128),
+            ([1, 1, 1], 1),
+        ] {
+            let psv = psv_with_group(48, group);
+            assert_eq!(
+                mesh_group_threads(Some(&psv)),
+                Ok(Some(threads)),
+                "{group:?}"
+            );
+        }
+        let refused = Err(ShaderError::Malformed(
+            "a mesh thread group past D3D12's limits",
+        ));
+        for group in [
+            [0, 1, 1],
+            [1, 0, 1],
+            [1, 1, 0],
+            [129, 1, 1],
+            [16, 16, 1],
+            [65536, 65536, 1],
+            [u32::MAX, u32::MAX, u32::MAX],
+        ] {
+            let psv = psv_with_group(48, group);
+            assert_eq!(mesh_group_threads(Some(&psv)), refused, "{group:?}");
+        }
+        // Runtime info before version 2 has no group size; nor does no part.
+        assert_eq!(
+            mesh_group_threads(Some(&psv_with_group(36, [0; 3]))),
+            Ok(None)
+        );
+        assert_eq!(mesh_group_threads(Some(&[])), Ok(None));
+        assert_eq!(mesh_group_threads(None), Ok(None));
+        // A version-2 size with the sizes cut off is malformed.
+        let cut = &psv_with_group(48, [8, 8, 1])[..4 + 40];
+        assert!(mesh_group_threads(Some(cut)).is_err());
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
