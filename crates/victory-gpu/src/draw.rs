@@ -2061,7 +2061,7 @@ impl State {
             return false;
         };
         let matches_kind = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && !p.compute && !p.mesh,
+            DRAW | INDEXED => !p.compute && !p.mesh,
             MESH => !p.compute && p.mesh,
             DISPATCH => p.compute,
             _ => false,

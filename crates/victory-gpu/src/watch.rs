@@ -78,6 +78,21 @@ impl Sweep {
             j.swept.clear();
         }
     }
+
+    /// Narrower form of [`Self::title_written`] when the CPU step writes only
+    /// `[address, address + len)`: unrelated swept pages stay valid so small
+    /// title copies do not force thousands of redundant `GetWriteWatch` calls.
+    pub(crate) fn title_written_range(address: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let first = address / PAGE;
+        let last = address.saturating_add(len).div_ceil(PAGE);
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if j.sweeper == Some(std::thread::current().id()) {
+            sweep_out(&mut j.swept, first, last);
+        }
+    }
 }
 
 impl Drop for Sweep {
@@ -124,6 +139,29 @@ fn sweep_in(swept: &mut Vec<(usize, usize)>, first: usize, last: usize) {
         j += 1;
     }
     swept.splice(i..j, [(a, e)]);
+}
+
+/// Removes `[first, last)` from `swept`, keeping it sorted and disjoint.
+fn sweep_out(swept: &mut Vec<(usize, usize)>, first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let i = swept.partition_point(|&(_, e)| e <= first);
+    let mut j = i;
+    let mut replacement = Vec::new();
+    while j < swept.len() && swept[j].0 < last {
+        let (a, e) = swept[j];
+        if a < first {
+            replacement.push((a, first));
+        }
+        if e > last {
+            replacement.push((last, e));
+        }
+        j += 1;
+    }
+    if j > i {
+        swept.splice(i..j, replacement);
+    }
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -785,6 +823,12 @@ mod tests {
         sweep_in(&mut s, 0, 2);
         sweep_in(&mut s, 1, 5);
         assert_eq!(s, [(0, 12)]);
+        sweep_out(&mut s, 4, 8);
+        assert_eq!(s, [(0, 4), (8, 12)]);
+        sweep_out(&mut s, 2, 10);
+        assert_eq!(s, [(0, 2), (10, 12)]);
+        sweep_out(&mut s, 0, 12);
+        assert!(s.is_empty());
     }
 
     /// A fresh write-watched allocation of `pages` pages. Never freed: the

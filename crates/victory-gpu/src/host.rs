@@ -3191,7 +3191,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written_range(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -3302,9 +3302,8 @@ impl Batch {
     ) {
         if self.new_gpu_write(shadow, address, len) {
             // The first declaration needs the refreshed bytes for its snapshot.
-            // Another declaration of this exact range is already pending until
-            // the GPU submission finishes, so it needs no refresh boundary.
-            self.flush();
+            // Flush only this shadow so unrelated buffers keep coalescing.
+            self.flush_shadow(shadow);
             shadow.writing(address, len);
             self.gpu_writes.push((shadow.clone(), address, len));
         }
@@ -3349,6 +3348,51 @@ impl Batch {
         self.flush();
         self.textures.clear();
         crate::watch::Sweep::title_written();
+    }
+
+    /// Before a CPU copy into `[dst, dst + len)` of title memory: flush only
+    /// pending refreshes overlapping that range and drop only those pages from
+    /// the write-watch sweep, keeping unrelated buffers coalesced and swept.
+    fn title_written_range(&mut self, dst: usize, len: usize) {
+        let end = dst.saturating_add(len);
+        let mut flush_now = Vec::new();
+        for (shadow, ranges) in &mut self.refreshes {
+            let mut hit = Vec::new();
+            ranges.retain(|&(from, to)| {
+                if from < end && to > dst {
+                    hit.push((from, to));
+                    false
+                } else {
+                    true
+                }
+            });
+            if !hit.is_empty() {
+                flush_now.push((shadow.clone(), hit));
+            }
+        }
+        self.refreshes.retain(|(_, ranges)| !ranges.is_empty());
+        for (shadow, mut ranges) in flush_now {
+            coalesce_ranges(&mut ranges, crate::watch::PAGE);
+            for (from, to) in ranges {
+                update(&shadow, from, to - from);
+            }
+        }
+        self.textures.clear();
+        crate::watch::Sweep::title_written_range(dst, len);
+    }
+
+    fn flush_shadow(&mut self, target: &std::sync::Arc<crate::shadow::Shadow>) {
+        if let Some(i) = self
+            .refreshes
+            .iter()
+            .position(|(s, _)| std::sync::Arc::ptr_eq(s, target))
+        {
+            let (shadow, mut ranges) = self.refreshes.swap_remove(i);
+            coalesce_ranges(&mut ranges, crate::watch::PAGE);
+            for (from, to) in ranges {
+                update(&shadow, from, to - from);
+            }
+        }
     }
 
     fn flush(&mut self) {
