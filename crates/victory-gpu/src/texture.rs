@@ -36,6 +36,8 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
+    /// Its bytes.
+    size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
@@ -286,6 +288,17 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging, copy);
 }
 
+/// GetCopyableFootprints may end the buffer at the last row's active bytes.
+fn footprint_len(
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    rows: u32,
+    buffer_size: u64,
+) -> u64 {
+    let f = footprint.Footprint;
+    let pitched = u64::from(f.RowPitch) * u64::from(rows) * u64::from(f.Depth);
+    pitched.min(buffer_size - footprint.Offset)
+}
+
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all). Returns `true` when the
@@ -427,13 +440,7 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let lines = rows as usize * f.Depth as usize;
-            let len = if self.widened_from.is_some() && lines > 0 {
-                // The last subresource allocation stops at the last row's used bytes.
-                pitch * (lines - 1) + f.Width as usize * 4
-            } else {
-                pitch * lines
-            };
+            let len = footprint_len(footprint, rows, self.size) as usize;
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
@@ -709,6 +716,7 @@ fn create_staging(
     });
     Some(Arc::new(Staging {
         buffer,
+        size: total,
         data,
         footprints,
         rows,
@@ -2152,5 +2160,28 @@ mod tests {
             readback_mip(host, resource_guard.0, host_tex, 2, 64, 64),
             expected_mip2
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upload_slice_stops_at_the_end_of_the_buffer() {
+        // 10x6 RGBA8 with two mips. Mip 1 has three 20-byte rows at pitch 256.
+        let mip = |offset, width, height| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: offset,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Width: width,
+                Height: height,
+                Depth: 1,
+                RowPitch: 256,
+                ..Default::default()
+            },
+        };
+        let total = 1536 + 2 * 256 + 20;
+        assert_eq!(footprint_len(&mip(0, 10, 6), 6, total), 1536);
+        assert_eq!(footprint_len(&mip(1536, 5, 3), 3, total), 532);
     }
 }
