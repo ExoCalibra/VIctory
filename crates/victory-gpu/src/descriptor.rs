@@ -897,9 +897,16 @@ mod tests {
             version: (1, 0),
             parts: Vec::new(),
         };
-        let shader =
-            victory_shader::emit::emit(&container, &native, &program, &flow, &io, &resources)
-                .unwrap();
+        let shader = victory_shader::emit::emit(
+            &container,
+            &native,
+            &program,
+            &flow,
+            &io,
+            &resources,
+            victory_shader::emit::Target::ANY,
+        )
+        .unwrap();
         assert_eq!(shader.root_indexed_views.len(), 1);
         assert!(shader.root_srvs.is_empty());
 
