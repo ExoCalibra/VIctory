@@ -88,6 +88,8 @@ pub mod host;
 mod lds_tests;
 mod lower;
 mod sampler;
+#[cfg(all(test, windows))]
+mod scratch_tests;
 mod shader;
 mod spin;
 mod threading;
