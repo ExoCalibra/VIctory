@@ -709,6 +709,8 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             // The bytes of the root CBV (slot 4) and SRV (slot 5) bound.
             (RootType::Descriptor, 4) => 64 * 4,
             (RootType::Descriptor, 5) => 32 * 4,
+            // Heap guards: the views these tests bind are all in range.
+            (RootType::ResourceHeap | RootType::SamplerHeap, _) => u32::MAX,
             other => panic!("unexpected user data {other:?}"),
         };
     }

@@ -21,7 +21,8 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; `spare` more follow them.
+    /// Slots mirroring the title's; `spare` dynamic slots follow them, and view
+    /// heaps end with one null guard slot ([`HostHeap::guard_slot`]).
     count: u32,
     /// Dynamic slots past the title's: [`DYNAMIC`] (or [`DYNAMIC_CAPPED`] when
     /// capped) in a view heap, [`SAMPLER_DYNAMIC`] in a capped sampler heap,
@@ -351,6 +352,7 @@ impl HostHeap {
         }
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the capped dynamic range, and the portable cap.
+        // A view heap ends with its guard slot (see [`HostHeap::guard_slot`]).
         let (heap, count, extra) = if sampler {
             match make(count) {
                 Ok(heap) => (heap, count, 0),
@@ -359,18 +361,18 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
+        } else if let Ok(heap) = make(count + DYNAMIC + 1) {
             (heap, count, DYNAMIC)
         } else {
-            match make(count + DYNAMIC_CAPPED) {
+            match make(count + DYNAMIC_CAPPED + 1) {
                 Ok(heap) => (heap, count, DYNAMIC_CAPPED),
-                Err(e) if count + DYNAMIC_CAPPED > PORTABLE_VIEWS => {
+                Err(e) if count + DYNAMIC_CAPPED + 1 > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; tables past `count` go through dynamic slots.
                     tracing::warn!(error = %e, count, dynamic = DYNAMIC_CAPPED, "host view heap capped at {PORTABLE_VIEWS}");
                     (
                         make(PORTABLE_VIEWS).ok()?,
-                        PORTABLE_VIEWS - DYNAMIC_CAPPED,
+                        PORTABLE_VIEWS - DYNAMIC_CAPPED - 1,
                         DYNAMIC_CAPPED,
                     )
                 }
@@ -384,7 +386,7 @@ impl HostHeap {
     }
 
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
-    /// ones, all made null.
+    /// ones, plus one trailing guard slot on view heaps, all made null.
     fn with(
         host: &Host,
         heap: ID3D12DescriptorHeap,
@@ -393,6 +395,7 @@ impl HostHeap {
         extra: u32,
     ) -> Option<Self> {
         let sampler = kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        let total = count + extra + u32::from(!sampler);
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -405,7 +408,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(total) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -417,7 +420,7 @@ impl HostHeap {
             spare: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: Mutex::new(vec![None; total as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             bindless: Mutex::default(),
         };
@@ -426,7 +429,7 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
             return None;
         }
@@ -573,6 +576,19 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The slot translated shaders read in place of a computed heap index
+    /// at or past it (a stale buffer can give any index, and one past the
+    /// heap hangs some GPUs): in a view heap its last slot, after the
+    /// dynamic ones, null from the start and never made; in a sampler heap
+    /// its last slot (any sampler reads safely).
+    pub(crate) fn guard_slot(&self) -> u32 {
+        if self.sampler {
+            (self.count + self.spare).saturating_sub(1)
+        } else {
+            self.count + self.spare
+        }
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
