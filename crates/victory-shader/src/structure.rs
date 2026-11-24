@@ -420,6 +420,8 @@ pub struct Structured {
     /// Symbolic select conditions, keyed by the destination SSA value.
     /// A wave64 condition belongs to the exact pair read by the select.
     pub(crate) select_masks: HashMap<Value, Bool>,
+    /// Exact Wave64 pairs for checking masks at their uses.
+    paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's; none for a
     /// split low dword, as in `masks`.
     pub highs: HashMap<Value, Value>,
@@ -455,6 +457,16 @@ pub struct Structured {
 
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
+
+impl Structured {
+    pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        match high {
+            Some(high) => self.paired_masks.get(&(low, high)),
+            None => self.masks.get(&low),
+        }
+        .copied()
+    }
+}
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
@@ -881,6 +893,11 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .copied()
                 .collect(),
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             reach: cond.to_vec(),
         })
     }
