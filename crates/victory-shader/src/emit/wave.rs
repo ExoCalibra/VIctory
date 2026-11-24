@@ -861,11 +861,6 @@ mod tests {
         );
     }
 
-    fn build(words: &[u32], wave64: bool) -> Program {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        crate::ir::build(&code, wave64, 8).unwrap()
-    }
-
     #[test]
     fn a_section_restores_exec_from_a_reload_of_the_saved_mask() {
         // Assembled with llvm-mc (gfx1030, wave32): the saved EXEC spilled

@@ -9712,7 +9712,7 @@ impl<'a> Lower<'a> {
                     };
                     match src {
                         Some((row, ch)) => total(l, row, ch).map(Some),
-                        None if f16 && explicit_second_row => Ok(Some(l.s.m.f32(0.0))),
+                        None if f16 && explicit_second_row => Ok(Some(l.s.m.f32(0))),
                         None => Ok(None),
                     }
                 };

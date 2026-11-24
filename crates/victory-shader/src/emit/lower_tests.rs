@@ -1623,8 +1623,8 @@ mod select_tests {
 
     #[test]
     fn explicit_packed_input_tail_is_padding() {
-        use super::super::container::SigElement;
-        use super::packed_input_half;
+        use super::super::super::container::SigElement;
+        use super::super::packed_input_half;
         let element = |row, cols| SigElement {
             name: "TEXCOORD".into(),
             index: row,
