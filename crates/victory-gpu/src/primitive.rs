@@ -693,7 +693,7 @@ float4 ps_main() : SV_Target { return float4(1.0, 1.0, 1.0, 1.0); }
         };
 
         let list = host.new_list().unwrap();
-        let rtv = host.rtv(&rt, None);
+        let rtv = host.rtv(Some(&rt), None);
         // SAFETY: open command list, live resources, valid scratch index views.
         unsafe {
             let l = &list.list;
