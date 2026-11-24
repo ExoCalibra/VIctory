@@ -64,7 +64,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // clean view both cost more than the copy they decide. Blocks are
     // pages, so `first..last` are the blocks. `JOURNAL` is taken before
     // `GUARDS` here as in `guard`; nothing takes them the other way round.
-    if guarded && first < last && guards().clean.range(first..last).count() == last - first {
+    if guarded
+        && first < last
+        && {
+            let g = guards();
+            g.clean.range(first..last).count() + g.absent.range(first..last).count() == last - first
+        }
+    {
         j.asked += 1;
         return Some((
             j.asked,
