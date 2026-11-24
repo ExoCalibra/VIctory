@@ -134,6 +134,13 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     })
 }
 
+/// Packed formats 68/69 occupy a pair of texels along X and one row along Y.
+fn texture_element(format: u32) -> Option<(u64, u64, u64)> {
+    let (bytes, width) = element(format)?;
+    let height = if matches!(format, 68 | 69) { 1 } else { width };
+    Some((bytes, width, height))
+}
+
 /// A texture's layout in console memory, as the console's layout library
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
 /// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
@@ -195,7 +202,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
     let bytes = if desc.dimension == BUFFER {
         desc.width
     } else {
-        let (element, block) = element(desc.format)?;
+        let (element, block_width, block_height) = texture_element(desc.format)?;
         let (depth, slices) = if desc.dimension == TEXTURE_3D {
             (u64::from(desc.depth_or_array_size), 1)
         } else {
@@ -205,8 +212,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         let mips = mip_count(desc);
         let mut chain = 0u64;
         for mip in 0..mips.min(64) {
-            let w = (desc.width >> mip).max(1).div_ceil(block);
-            let h = (height >> mip).max(1).div_ceil(block);
+            let w = (desc.width >> mip).max(1).div_ceil(block_width);
+            let h = (height >> mip).max(1).div_ceil(block_height);
             let d = (depth >> mip).max(1);
             chain = chain.checked_add(w.checked_mul(h)?.checked_mul(d)?.checked_mul(element)?)?;
         }
@@ -582,9 +589,9 @@ pub(crate) struct PlacedFootprint {
 impl PlacedFootprint {
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
-        let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
-        let last = u64::from(self.width).div_ceil(block) * element;
+        let (element, block_width, block_height) = texture_element(self.format)?;
+        let lines = u64::from(self.height).div_ceil(block_height) * u64::from(self.depth);
+        let last = u64::from(self.width).div_ceil(block_width) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 }
@@ -624,17 +631,17 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     if slice >= slices {
         return None;
     }
-    let (element, block) = element(desc.format)?;
-    let width = (desc.width >> mip).max(1).next_multiple_of(block);
+    let (element, block_width, block_height) = texture_element(desc.format)?;
+    let width = (desc.width >> mip).max(1).next_multiple_of(block_width);
     let height = (u64::from(desc.height) >> mip)
         .max(1)
-        .next_multiple_of(block);
+        .next_multiple_of(block_height);
     let depth = if desc.dimension == TEXTURE_3D {
         (u32::from(desc.depth_or_array_size) >> mip).max(1)
     } else {
         1
     };
-    let row_size = width / block * element;
+    let row_size = width / block_width * element;
     let footprint = PlacedFootprint {
         offset: 0,
         format: desc.format,
@@ -643,7 +650,7 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
         depth,
         row_pitch: u32::try_from(row_size.next_multiple_of(PITCH)).ok()?,
     };
-    Some((footprint, u32::try_from(height / block).ok()?, row_size))
+    Some((footprint, u32::try_from(height / block_height).ok()?, row_size))
 }
 
 /// Device method: where each subresource goes in an upload buffer. Rows
