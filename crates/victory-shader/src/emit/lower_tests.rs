@@ -1620,4 +1620,31 @@ mod select_tests {
             assert_eq!(wave_ops, uses_select);
         }
     }
+
+    #[test]
+    fn explicit_packed_input_tail_is_padding() {
+        use super::super::container::SigElement;
+        use super::packed_input_half;
+        let element = |row, cols| SigElement {
+            name: "TEXCOORD".into(),
+            index: row,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols,
+            usage: 0,
+            half: true,
+        };
+        let sig = vec![element(6, 4), element(7, 2)];
+        assert_eq!(
+            packed_input_half(&sig, 6, Some(7), 5, true),
+            Ok(Some((7, 1)))
+        );
+        assert_eq!(packed_input_half(&sig, 6, Some(7), 6, true), Ok(None));
+        assert_eq!(packed_input_half(&sig, 6, Some(7), 7, true), Ok(None));
+        assert!(packed_input_half(&sig, 6, Some(7), 6, false).is_err());
+        assert!(packed_input_half(&sig, 6, None, 4, false).is_err());
+    }
 }

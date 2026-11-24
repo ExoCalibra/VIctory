@@ -866,6 +866,24 @@ fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(
     (c < extent(b)?).then_some((b, c))
 }
 
+/// A packed pixel input half, or `None` for padding explicitly described by
+/// the metadata. With an inferred partner, a missing half instead remains an
+/// error: the inference must not turn real data into zeroes.
+fn packed_input_half(
+    elements: &[SigElement],
+    a: u8,
+    b: Option<u8>,
+    h: u8,
+    explicit_second_row: bool,
+) -> Result<Option<(u8, u8)>, Why> {
+    let half = packed_half(elements, a, b, h);
+    if half.is_none() && !explicit_second_row {
+        Err("a packed input half no element holds")
+    } else {
+        Ok(half)
+    }
+}
+
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
 /// a packed row's partner is the next 16-bit row of the signature that no
 /// output entry names, taken in row order.
@@ -9636,6 +9654,11 @@ impl<'a> Lower<'a> {
             }
         };
         let packing = self.half_inputs.get(&attribute.row).copied();
+        let explicit_second_row = matches!(
+            &self.x.native.io,
+            StageIo::Ps { inputs, .. }
+                if inputs.iter().any(|i| i.row == attribute.row && i.fp16 && i.pack2 && i.row2 != i.row)
+        );
         let f16 = name.ends_with("_f16");
         // The evaluated channel plus `add`, as a float.
         let total = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
@@ -9656,13 +9679,16 @@ impl<'a> Lower<'a> {
                 // 16-bit values: one in the low half of each dword, or two
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
-                    let src = if pack2 {
+                    let src = if pack2 && f16 {
+                        packed_input_half(&l.s.inputs, attribute.row, b, h, explicit_second_row)?
+                    } else if pack2 {
                         packed_half(&l.s.inputs, attribute.row, b, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
                     match src {
                         Some((row, ch)) => total(l, row, ch).map(Some),
+                        None if f16 && explicit_second_row => Ok(Some(l.s.m.f32(0.0))),
                         None => Ok(None),
                     }
                 };
