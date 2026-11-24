@@ -116,6 +116,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Resource properties of each heap handle made, in creation order.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
     #[cfg(test)]
     pub has_isnan_op: bool,
     #[cfg(test)]
@@ -582,6 +585,10 @@ struct Lower<'a> {
     descriptor_dwords: HashSet<Value>,
     atomic_descriptor_loads: HashSet<Site>,
     scalar: HashMap<Site, Address>,
+    /// Tracked descriptor addresses stored to or modified atomically.
+    written_uavs: HashSet<(usize, u32, Option<Value>)>,
+    /// Tracked descriptor addresses accessed with `glc` and never sampled.
+    glc_uavs: HashSet<(usize, u32, Option<Value>)>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     /// Each f16 interpolation's first half preserves its old high half.
@@ -1094,6 +1101,19 @@ fn atomic_descriptor_loads(p: &Program, res: &Resources) -> HashSet<Site> {
     loads
 }
 
+pub(super) const UAV_PROP: u32 = 0x1000;
+pub(super) const GLOBALLY_COHERENT_PROP: u32 = 0x4000;
+
+pub(super) fn uav_bits(uav: bool, glc: bool) -> u32 {
+    if !uav {
+        0
+    } else if glc {
+        UAV_PROP | GLOBALLY_COHERENT_PROP
+    } else {
+        UAV_PROP
+    }
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -1200,6 +1220,64 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
+        let desc_addr = |load: Site, first: u8| {
+            let a = scalar.get(&load)?;
+            Some((
+                a.param,
+                a.offset.wrapping_add(4 * u32::from(first)),
+                a.dynamic,
+            ))
+        };
+        let mut written_uavs = HashSet::new();
+        let mut glc_uavs = HashSet::new();
+        let mut sampled = HashSet::new();
+        for d in x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+        {
+            let inst = &p.blocks[d.site.0].insts[d.site.1];
+            let name = inst.name();
+            let is_sample = matches!(
+                &inst.fields,
+                Fields::Image {
+                    sampler: Some(_),
+                    ..
+                }
+            );
+            let is_write = name.contains("store") || name.contains("atomic");
+            let is_glc = match &inst.fields {
+                Fields::Buffer {
+                    cache,
+                    format: None,
+                    ..
+                } => cache.glc,
+                Fields::Image {
+                    cache,
+                    sampler: None,
+                    ..
+                } => cache.glc && (is_write || name == "image_load"),
+                Fields::Smem { cache, .. } => cache.glc && name.starts_with("s_buffer_load_"),
+                _ => false,
+            };
+            for leaf in d.source.leaves() {
+                if let &(Source::Loaded { load, first } | Source::Fetched { load, first }) = leaf
+                    && let Some(addr) = desc_addr(load, first)
+                {
+                    if is_sample {
+                        sampled.insert(addr);
+                    }
+                    if is_write {
+                        written_uavs.insert(addr);
+                    } else if is_glc {
+                        glc_uavs.insert(addr);
+                    }
+                }
+            }
+        }
+        glc_uavs.retain(|a| !sampled.contains(a));
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let dead = crate::sgpr_spill::dead(p);
         let writes_uavs = insts().any(|i| {
@@ -1207,7 +1285,8 @@ impl<'a> Lower<'a> {
                 i.fields,
                 Fields::Image { .. } | Fields::Buffer { .. } | Fields::Flat { .. }
             ) && (i.name().contains("store") || i.name().contains("atomic"))
-        });
+        }) || (x.native.stage == HwStage::Cs
+            && (!written_uavs.is_empty() || !glc_uavs.is_empty()));
         let wide_lds =
             insts().any(|i| ds_integer_atomic(i.name()).is_some_and(|(_, wide, _)| wide));
         let mut console_lanes = false;
@@ -1595,7 +1674,9 @@ impl<'a> Lower<'a> {
             first_lane_src,
             data_reads,
             descriptor_dwords,
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
+            written_uavs,
+            glc_uavs,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             first_halves: p
@@ -2547,6 +2628,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            heap_props: self.s.heap_props.clone(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6119,6 +6202,7 @@ impl<'a> Lower<'a> {
             data,
             offset,
             soffset,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -6210,19 +6294,13 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let on_pair = matches!(src, Source::Built { address, .. } if self.in_constants(address));
+        let uav = self.is_uav(src);
         if on_pair
-            || matches!(
-                kind,
-                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
-            )
+            || uav
+            || matches!(kind, Some(u) if u.kind == ResourceType::Srv)
         {
-            let u_bit = if matches!(kind, Some(u) if u.kind == ResourceType::Uav) {
-                0x1000
-            } else {
-                0
-            };
             // Scalar buffer loads address bytes, even when the descriptor carries a stride.
-            let h = self.handle(site, src, false, (11 | u_bit, 0))?;
+            let h = self.handle(site, src, false, (11 | uav_bits(uav, cache.glc), 0))?;
             let elem_off = self.s.m.undef(self.s.t.i32);
             let (in_bounds, safe_addr) = self.bound_raw_offset(addr);
             for k in 0..count {
@@ -6348,10 +6426,8 @@ impl<'a> Lower<'a> {
             let used = self.used_kind(&src);
             let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
             let un = ui.name();
-            let uav = un.contains("store")
-                || un.contains("atomic")
-                || used.is_some_and(|u| u.kind == ResourceType::Uav);
-            let u = if uav { 0x1000 } else { 0 };
+            let uav = un.contains("store") || un.contains("atomic") || self.is_uav(&src);
+            let u = uav_bits(uav, false);
             let (props, image) = match &ui.fields {
                 Fields::Image { dim, .. } => {
                     let kind = match dim {
@@ -7425,6 +7501,34 @@ impl<'a> Lower<'a> {
         };
         local.insert(v, x);
         Ok(x)
+    }
+
+    fn desc_addr(&self, load: Site, first: u8) -> Option<(usize, u32, Option<Value>)> {
+        let a = self.scalar.get(&load)?;
+        Some((
+            a.param,
+            a.offset.wrapping_add(4 * u32::from(first)),
+            a.dynamic,
+        ))
+    }
+
+    pub(super) fn is_uav(&self, src: &Source) -> bool {
+        let leaves = src.leaves();
+        let in_set = |set: &HashSet<(usize, u32, Option<Value>)>| {
+            leaves.iter().any(|l| match **l {
+                Source::Loaded { load, first } | Source::Fetched { load, first } => self
+                    .desc_addr(load, first)
+                    .is_some_and(|a| set.contains(&a)),
+                _ => false,
+            })
+        };
+        if in_set(&self.written_uavs) {
+            return true;
+        }
+        match self.used_kind(src) {
+            Some(u) => u.kind == ResourceType::Uav,
+            None => in_set(&self.glc_uavs),
+        }
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.

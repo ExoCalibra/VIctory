@@ -14,6 +14,7 @@ impl<'a> Lower<'a> {
             d16,
             tfe,
             lwe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -80,11 +81,8 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
-        let uav = store
-            || self
-                .used_kind(src)
-                .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let uav = store || self.is_uav(src);
+        let props = (kind | uav_bits(uav, cache.glc), 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -100,9 +98,6 @@ impl<'a> Lower<'a> {
                 "swap" => 8,
                 "cmpswap" => u32::MAX,
                 _ => return Err(name),
-            };
-            let Fields::Image { cache, .. } = &inst.fields else {
-                unreachable!()
             };
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
@@ -141,7 +136,7 @@ impl<'a> Lower<'a> {
             } else {
                 original
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, component))?;
+            let h = self.handle(site, src, false, (kind | uav_bits(true, cache.glc), component))?;
             let mut args = vec![h];
             let (intrinsic, opcode) = if compare {
                 let comparand = if wide {
@@ -997,6 +992,7 @@ impl<'a> Lower<'a> {
             format,
             lds,
             tfe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -1165,8 +1161,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let uav = store || atomic.is_some() || self.is_uav(src);
+        let u = uav_bits(uav, cache.glc);
         let iu = self.s.m.undef(self.s.t.i32);
         if sub_load.is_some() || sub_store.is_some() {
             let data = data.as_ref().ok_or("buffer sub-dword data")?;
@@ -1246,7 +1242,7 @@ impl<'a> Lower<'a> {
             _ => (off, None),
         };
         if let Some(op) = atomic {
-            let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+            let returns = cache.glc;
             if op == "csub" && !returns {
                 // LLVM BUFInstructions.td only selects the returning form
                 // on GFX10.3.
