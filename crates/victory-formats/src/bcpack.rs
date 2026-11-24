@@ -1782,11 +1782,11 @@ mod tests {
                             left: 1,
                             ..Default::default()
                         };
-                        lane.step(&t).unwrap();
+                        lane.step(&t);
                         let (sym, next) = reference_decode(&t, model, x);
                         assert_eq!(
                             (lane.out, lane.x),
-                            (Some(sym), next),
+                            (u16::from(sym), next),
                             "model {model} x {x:#x}"
                         );
                     }
