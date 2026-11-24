@@ -3678,6 +3678,104 @@ fn root_srv_s_lshl2_add_u32_with_root_constant_dword0() {
         assert_eq!(
             got, want,
             "{backend}: s_lshl2_add_u32 index {} + {}B = {got:#010x}, want {want:#010x}",
+
+fn v_cmp_class_f32_matches_rdna2() {
+    // v_cmp_class_f32_e64 s6, v1, v2 (VOP3 opcode 0x088); v_cndmask_b32_e64 v0, 0, 1, s6
+    let cmp = build_valu_cs(&[
+        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[0],
+        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // Same with neg on src0 (bit 29 of w1).
+    let [w0, mut w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+    w1 |= 1 << 29; // neg[0] = 1
+    let cmp_neg = build_valu_cs(&[
+        w0,
+        w1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+
+    // All 10 IEEE-754 binary32 classes: bit k corresponds to class k.
+    let classes: &[(u32, u32)] = &[
+        (0x7F80_0001, 0), // +sNaN (quiet bit 0x0040_0000 clear)
+        (0xFFBF_FFFF, 0), // -sNaN (sign ignored for NaNs)
+        (0x7FC0_0000, 1), // +qNaN
+        (0xFFC0_0001, 1), // -qNaN
+        (0xFF80_0000, 2), // -inf
+        (0xBF80_0000, 3), // -normal (-1.0)
+        (0x8000_0001, 4), // -denormal
+        (0x8000_0000, 5), // -0.0
+        (0x0000_0000, 6), // +0.0
+        (0x0000_0001, 7), // +denormal
+        (0x3F80_0000, 8), // +normal (+1.0)
+        (0x7F80_0000, 9), // +inf
+    ];
+    let mut cases = Vec::new();
+    for &(bits, cls) in classes {
+        // Exact class bit -> true; complement across all 10 bits -> false.
+        cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
+        cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
+    }
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32({:#010x}, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+
+    // Negated src0: +1.0 -> -normal (class 3), +0.0 -> -0.0 (class 5),
+    // +denormal -> -denormal (class 4), +sNaN -> still sNaN (class 0, not quieted).
+    let neg_cases: &[([u32; 4], u32)] = &[
+        ([0x3F80_0000, 1 << 3, 0, 0], 1),
+        ([0x3F80_0000, 1 << 8, 0, 0], 0),
+        ([0x0000_0000, 1 << 5, 0, 0], 1),
+        ([0x0000_0000, 1 << 6, 0, 0], 0),
+        ([0x0000_0001, 1 << 4, 0, 0], 1),
+        ([0x0000_0001, 1 << 7, 0, 0], 0),
+        ([0x7F80_0001, 1 << 0, 0, 0], 1),
+        ([0x7F80_0001, 1 << 1, 0, 0], 0),
+    ];
+    let neg_in: Vec<[u32; 4]> = neg_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_neg, &neg_in, |backend, i, inp, got| {
+        let want = neg_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32(-({:#010x}), {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+
+    // Abs on src0 (bit 8 of w0): -1.0 -> +normal (class 8), -0.0 -> +0.0 (class 6),
+    // -denormal -> +denormal (class 7), -sNaN -> still sNaN (class 0, not quieted).
+    let [mut a0, a1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+    a0 |= 1 << 8; // abs[0] = 1
+    let cmp_abs = build_valu_cs(&[
+        a0,
+        a1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    let abs_cases: &[([u32; 4], u32)] = &[
+        ([0xBF80_0000, 1 << 8, 0, 0], 1),
+        ([0xBF80_0000, 1 << 3, 0, 0], 0),
+        ([0x8000_0000, 1 << 6, 0, 0], 1),
+        ([0x8000_0000, 1 << 5, 0, 0], 0),
+        ([0x8000_0001, 1 << 7, 0, 0], 1),
+        ([0x8000_0001, 1 << 4, 0, 0], 0),
+        ([0xFF80_0001, 1 << 0, 0, 0], 1),
+        ([0xFF80_0001, 1 << 1, 0, 0], 0),
+    ];
+    let abs_in: Vec<[u32; 4]> = abs_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_abs, &abs_in, |backend, i, inp, got| {
+        let want = abs_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32(|{:#010x}|, {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
     });
@@ -4043,3 +4141,4 @@ fn ds_swizzle_masked_rotations() {
         }
     }
 }
+
