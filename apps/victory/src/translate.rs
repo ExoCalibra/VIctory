@@ -144,12 +144,12 @@ impl Tally {
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
-struct Checks {
+struct Checks<'a> {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
-    host: Option<(Host, emit::HostShader)>,
+    host: Option<(&'a Host, &'a emit::HostShader)>,
 }
 
 pub fn run(
@@ -169,9 +169,17 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
+    // Share one host D3D12 device across every worker thread and file instead
+    // of creating a new device per thread/file (which multiplies driver commit
+    // memory by the thread count).
+    let shared_host = if pipelines {
+        Some((
+            Host::new(false).map_err(anyhow::Error::msg)?,
+            host::stub_ps(),
+        ))
+    } else {
+        None
+    };
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -208,9 +216,7 @@ pub fn run(
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
+                            host: shared_host.as_ref().map(|(h, stub)| (h, stub)),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -271,7 +277,14 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let fallback_host;
+        let host = match &shared_host {
+            Some((h, _)) => h,
+            None => {
+                fallback_host = Host::new(false).map_err(anyhow::Error::msg)?;
+                &fallback_host
+            }
+        };
         let kept = lock(&kept);
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
@@ -306,7 +319,7 @@ fn translate(
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -418,7 +431,7 @@ fn translate(
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
     label: impl Fn() -> String,
 ) {
     if let Some(keep) = &checks.keep {
@@ -668,4 +681,27 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_host_compiles_pipelines_across_scoped_workers() {
+        let Ok(host) = Host::new(false).or_else(|_| Host::new(true)) else {
+            return;
+        };
+        let stub_ps = host::stub_ps();
+        let stub_vs = host::stub_vs(&stub_ps).expect("stub vertex shader");
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let _ = host
+                        .pipeline(&stub_vs, &stub_ps)
+                        .expect("compile pipeline on shared host");
+                });
+            }
+        });
+    }
 }
