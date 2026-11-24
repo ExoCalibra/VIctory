@@ -339,9 +339,10 @@ impl RtvRecord {
         {
             words[0] = format;
         }
-        // Render target and depth views: a packed 16-bit target may be
-        // R8G8B8A8_UNORM on this GPU (`resource::target_format`, which also
-        // applies `pc_format`).
+        // Render target and depth views: formats the host substitutes for
+        // targets/UAVs (packed 16-bit -> R8G8B8A8_UNORM, R9G9B9E5_SHAREDEXP
+        // -> R16G16B16A16_FLOAT) use `resource::target_format`, which also
+        // applies `pc_format`.
         words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
