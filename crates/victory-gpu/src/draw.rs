@@ -75,7 +75,7 @@ pub(crate) struct State {
     vertex: [VertexView; 32],
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
-    targets: Vec<usize>,
+    targets: Vec<(usize, Option<std::ops::Range<u32>>)>,
     depth: Option<DepthTarget>,
     /// The current draw also samples its read-only depth target.
     depth_sampled: bool,
@@ -409,10 +409,14 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
-            self.targets.push(record.resource as usize);
+            let desc = record.desc();
+            self.targets.push((
+                record.resource as usize,
+                crate::descriptor::rtv_mips(texture, desc.as_ref()),
+            ));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            rtvs.push(host.rtv(Some(texture), desc.as_ref()));
         }
         self.depth = None;
         self.depth_sampled = false;
@@ -571,8 +575,8 @@ impl State {
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
-        for &t in &self.targets {
-            crate::list::ensure_state(list, t as This, RENDER_TARGET);
+        for (resource, mips) in &self.targets {
+            crate::list::ensure_mips(list, *resource as This, RENDER_TARGET, mips.clone());
         }
         self.ensure_depth_state(list);
         true
@@ -1110,7 +1114,7 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
+            .filter_map(|&(resource, _)| crate::resource::host_resource(resource as This))
             .map(|t| {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
@@ -1604,10 +1608,11 @@ fn readable(
         }
     }
     match (view, kind) {
-        (View::Shader(resource, _), ResourceType::Srv) => {
-            if let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
-            {
+        (View::Shader(resource, desc), ResourceType::Srv) => {
+            let Some(t) = crate::resource::host_resource(*resource as This) else {
+                return false;
+            };
+            if crate::texture::title_written(t) {
                 crate::texture::upload(list, *resource as This, t);
             }
             // Keep the same read bits the depth target will request at draw time.
@@ -1617,9 +1622,12 @@ fn readable(
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            let mips = (!samples_depth)
+                .then(|| desc.as_ref().and_then(|d| crate::descriptor::host::srv_mips(t, d)))
+                .flatten();
+            crate::list::ensure_mips(list, *resource as This, state, mips);
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
@@ -1772,20 +1780,25 @@ mod depth_tests {
             state.set_targets(&list, &[], dsv);
             state.set_heaps(&[views]);
             state.set_table(false, 0, srv);
+            let no_transition = |wanted| {
+                let mut changed = false;
+                list.transition(depth, wanted, None, |_, _, _, _| changed = true);
+                !changed
+            };
             crate::list::ensure_state(&list, depth, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
             state.ensure_depth_state(&list);
             assert!(
-                list.transition(depth, unsampled_state).is_none(),
+                no_transition(unsampled_state),
                 "unsampled depth state for {flags:?}"
             );
             state.tables(&list, &[used], &[], false);
             assert!(
-                list.transition(depth, shader_state).is_none(),
+                no_transition(shader_state),
                 "shader-table state for {flags:?}"
             );
             state.ensure_depth_state(&list);
             assert!(
-                list.transition(depth, draw_state).is_none(),
+                no_transition(draw_state),
                 "depth state for {flags:?}"
             );
             list.close();
