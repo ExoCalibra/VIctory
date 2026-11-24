@@ -546,7 +546,14 @@ impl HostHeap {
         let Some(first) = free_table(taken, *next as usize, n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
+                let (free, longest) = free_space(taken);
+                tracing::warn!(
+                    n,
+                    cap = taken.len(),
+                    free,
+                    longest,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
             });
             return None;
         };
@@ -1481,6 +1488,17 @@ fn valid_title_address(address: u64, len: u64) -> bool {
     plausible(address, len)
         && (crate::shadow::in_buffer(address, len)
             || crate::texture::committed(address as *const u8, 1))
+}
+
+/// Total free slots and the longest contiguous run in the physical heap.
+fn free_space(taken: &[bool]) -> (usize, usize) {
+    let mut free = 0;
+    let mut longest = 0;
+    for gap in taken.split(|&held| held) {
+        free += gap.len();
+        longest = longest.max(gap.len());
+    }
+    (free, longest)
 }
 
 /// Try each possible table start from the cursor, then from slot zero.
@@ -2761,6 +2779,14 @@ void main() {
                 }
             }
         }
+    }
+
+    #[test]
+    fn free_space_counts_separate_runs_at_the_heap_ends() {
+        assert_eq!(free_space(&[true; 8]), (0, 0));
+        assert_eq!(free_space(&[false; 8]), (8, 8));
+        let fragmented = [false, false, true, false, true, false, false, false];
+        assert_eq!(free_space(&fragmented), (6, 3));
     }
 
     #[test]
