@@ -6333,6 +6333,56 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether `src` is a descriptor built around a root SRV's or UAV's
+    /// address.
+    fn on_root_descriptor(&self, src: &Source) -> bool {
+        matches!(src, Source::Built { address, .. }
+            if self
+                .x
+                .native
+                .layout
+                .get(address.param)
+                .is_some_and(|rp| rp.root == RootType::Descriptor))
+    }
+
+    /// The handle, in-bounds flag, and two coordinates of a structured access
+    /// to element `index`, byte `off` of it (`bytes` wide): a structured buffer
+    /// view, or, for a root descriptor (a bare address on the host, with no
+    /// stride of its own), its raw view at byte `index * stride + off`,
+    /// bounded both below 2 GiB and by the host's root view byte size.
+    fn structured(
+        &mut self,
+        site: Site,
+        src: &Source,
+        u: u32,
+        stride: u32,
+        bytes: u32,
+        (index, off): (V, V),
+    ) -> Result<(V, V, V, V), Why> {
+        if self.on_root_descriptor(src) && stride > 0 {
+            let (ok2g, safe_idx, safe_off) = self.bound_structured(index, off, stride);
+            let c = self.cur;
+            let s = self.s.m.i32(stride);
+            let at = self.s.m.bin(c, Bin::Mul, safe_idx, s);
+            let at = self.s.m.bin(c, Bin::Add, at, safe_off);
+            let (ok, at) = match self.root_view_size(src) {
+                Some(size) => {
+                    let (ok_root, at) = self.in_root_view(size, at, bytes);
+                    (self.s.m.bin(c, Bin::And, ok2g, ok_root), at)
+                }
+                None => (ok2g, at),
+            };
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            return Ok((h, ok, at, self.s.m.undef(self.s.t.i32)));
+        }
+        if stride < 4 || !stride.is_multiple_of(4) {
+            return Err("a structured buffer of unknown stride");
+        }
+        let h = self.handle(site, src, false, (12 | u, stride))?;
+        let (ok, safe_idx, safe_off) = self.bound_structured(index, off, stride);
+        Ok((h, ok, safe_idx, safe_off))
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -10884,15 +10934,18 @@ impl<'a> Lower<'a> {
             let zero = self.s.m.int_const(ty, 0);
             let (h, in_bounds, coords) = match index {
                 Some(index) => {
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
                     if wide && !stride.is_multiple_of(8) {
                         return Err("a 64-bit buffer atomic without an eight-byte-aligned stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    let (ok, safe_idx, safe_off) = self.bound_structured(index, off, stride);
-                    (h, ok, [safe_idx, safe_off, iu])
+                    let (h, ok, a, b) = self.structured(
+                        site,
+                        src,
+                        u,
+                        stride,
+                        4 * u32::from(words),
+                        (index, off),
+                    )?;
+                    (h, ok, [a, b, iu])
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
@@ -10988,12 +11041,9 @@ impl<'a> Lower<'a> {
                 let ok = match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        let (ok, safe_idx, safe_off) = self.bound_structured(index, off, stride);
-                        args.extend([safe_idx, safe_off]);
+                        let (h, ok, a, b) =
+                            self.structured(site, src, u, stride, 4 * count, (index, off))?;
+                        args.extend([h, a, b]);
                         ok
                     }
                     None => {
@@ -11061,18 +11111,15 @@ impl<'a> Lower<'a> {
             match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    let (ok, safe_idx, safe_off) = self.bound_structured(index, off, stride);
+                    let (h, ok, a, b) =
+                        self.structured(site, src, u, stride, 4 * count, (index, off))?;
                     let r = self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, safe_idx, safe_off, mask, align],
+                        &[h, a, b, mask, align],
                     );
                     (r, ok)
                 }
