@@ -580,7 +580,7 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// bit) as a number.
 /// Samples whose level comes from derivatives across each quad of lanes.
 fn implicit_derivatives(name: &str) -> bool {
-    matches!(name, "image_sample" | "image_sample_b")
+    sample_form(name).is_some_and(|f| !f.gather && !f.c && !f.d && !f.l && !f.lz)
 }
 
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -4827,6 +4827,7 @@ impl<'a> Lower<'a> {
                 let (height, depth) = match kind {
                     1 => (one, one),
                     2 | 3 => (field(self, 1), one),
+                    5 => (field(self, 1), self.s.m.i32(6)),
                     6 => (one, field(self, 1)),
                     _ => (field(self, 1), field(self, 2)),
                 };
@@ -6123,16 +6124,6 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
-    }
-
-    fn join64(&mut self, lo: V, hi: V) -> V {
-        let c = self.cur;
-        let ty = self.s.m.int(64);
-        let lo = self.s.m.cast(c, Cast::ZExt, lo, ty);
-        let hi = self.s.m.cast(c, Cast::ZExt, hi, ty);
-        let shift = self.s.m.int_const(ty, 32);
-        let hi = self.s.m.bin(c, Bin::Shl, hi, shift);
-        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
