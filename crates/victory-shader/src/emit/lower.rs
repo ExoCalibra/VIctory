@@ -1865,7 +1865,7 @@ impl<'a> Lower<'a> {
         if let Some((width, signed, half)) = sub {
             let x = self.read_subword(load_off, width, signed, dword)?;
             let x = match in_bounds {
-                Some(ok) => self.s.m.select(c, ok, x, zero),
+                Some(ok) => self.s.m.select(self.cur, ok, x, zero),
                 None => x,
             };
             self.write_subword_result(inst, reg, x, half, guard)?;

@@ -1488,8 +1488,8 @@ mod tests {
         let _dead_root_srv = s.root_srv_handle(0);
 
         let idx0 = s.m.i32(0);
-        let uav_h = s.heap_handle(b, idx0, false, (10 | 0x1000, 0x409));
-        let _samp_h = s.heap_handle(b, idx0, true, (14, 0));
+        let uav_h = s.heap_handle(b, idx0, false, false, (10 | 0x1000, 0x409));
+        let _samp_h = s.heap_handle(b, idx0, true, false, (14, 0));
         let iu = s.m.undef(s.t.i32);
         let _dead_uav_ld = s.op(
             b,
