@@ -11232,20 +11232,21 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let overwritten = !bit
-                    && self.read_phis.contains(&phi.value)
-                    && self.overwritten_movreld_edge(b, phi, n).is_some();
-                let is_bary = self
-                    .x
-                    .io
-                    .inputs
-                    .iter()
-                    .any(|&(w, i)| w == arg && matches!(i, Input::Barycentric { .. }));
-                if self.read_phis.contains(&phi.value)
-                    && !self.vals.contains_key(&arg)
-                    && !(overwritten && is_bary)
-                {
-                    let _ = self.lazy_barycentric(arg);
+                let mut is_bary = false;
+                let mut overwritten_bary = false;
+                if !bit && self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
+                    is_bary = self
+                        .x
+                        .io
+                        .inputs
+                        .iter()
+                        .any(|&(w, i)| w == arg && matches!(i, Input::Barycentric { .. }));
+                    if is_bary {
+                        overwritten_bary = self.overwritten_movreld_edge(b, phi, n).is_some();
+                        if !overwritten_bary {
+                            let _ = self.lazy_barycentric(arg);
+                        }
+                    }
                 }
                 // An edge from outside a loop takes the loop's final value.
                 let looked = match self.finals.get(&arg) {
@@ -11264,8 +11265,13 @@ impl<'a> Lower<'a> {
                     {
                         self.s.m.i32(0)
                     }
-                    (Some(Val::Missing(_)), false) if overwritten => self.s.m.undef(self.s.t.i32),
-                    (None, false) if overwritten && is_bary => self.s.m.undef(self.s.t.i32),
+                    (Some(Val::Missing(_)), false)
+                        if self.read_phis.contains(&phi.value)
+                            && self.overwritten_movreld_edge(b, phi, n).is_some() =>
+                    {
+                        self.s.m.undef(self.s.t.i32)
+                    }
+                    (None, false) if overwritten_bary && is_bary => self.s.m.undef(self.s.t.i32),
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
