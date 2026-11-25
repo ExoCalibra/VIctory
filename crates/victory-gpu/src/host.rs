@@ -2403,11 +2403,22 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
 
 /// [`blocked_by`] over one slice of steps, returning `(reason, read_stat)` with
 /// `WHY_RUN` taking precedence over an earlier `WHY_READ`.
+#[cfg(test)]
 fn blocked_by_steps<'a>(
     written: &[(usize, usize)],
     by_copy: &[(usize, usize, usize)],
     immed: &[(usize, usize)],
     steps: impl IntoIterator<Item = &'a Step>,
+) -> Option<(usize, Option<usize>)> {
+    blocked_by_steps_counted(written, by_copy, immed, steps, false)
+}
+
+fn blocked_by_steps_counted<'a>(
+    written: &[(usize, usize)],
+    by_copy: &[(usize, usize, usize)],
+    immed: &[(usize, usize)],
+    steps: impl IntoIterator<Item = &'a Step>,
+    count: bool,
 ) -> Option<(usize, Option<usize>)> {
     if written.is_empty() && immed.is_empty() {
         return None;
@@ -2487,7 +2498,9 @@ fn blocked_by(
     let mut read_stat: Option<Option<usize>> = None;
     for list in runs {
         let deferred = list.deferred();
-        if let Some((why, stat)) = blocked_by_steps(written, by_copy, immed, &deferred.copies) {
+        if let Some((why, stat)) =
+            blocked_by_steps_counted(written, by_copy, immed, &deferred.copies, count)
+        {
             if why == WHY_RUN {
                 return Some(WHY_RUN);
             }
