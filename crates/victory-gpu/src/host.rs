@@ -6739,7 +6739,6 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 
-<<<<<<< HEAD
     #[test]
     fn buffer_states_track_transitions_and_execute_on_d3d12() {
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -6908,25 +6907,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         use std::sync::atomic::Ordering;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
-=======
-    #[cfg(windows)]
-    #[test]
-    fn read_backs_tracks_spans_copies_mapped_rows_and_skips_unmapped_memory() {
-        use super::{read_back_ranges, read_back_span, read_backs};
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-        };
-
-        assert_eq!(read_back_span(0x1000, [16, 3, 64]), Some((0x1000, 0x1090)));
-        assert_eq!(read_back_span(0x1000, [0, 3, 64]), None);
-        assert_eq!(read_back_span(0x1000, [16, 0, 64]), None);
-        assert_eq!(read_back_span(usize::MAX - 8, [16, 1, 16]), None);
->>>>>>> 43bc444 (GPU/host: track deferred read-backs in late line.written and copy via write_mapped)
 
         let Some(host) = super::host() else {
             return;
         };
-<<<<<<< HEAD
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Alignment: 0,
@@ -6990,7 +6974,24 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             copy.state.load(Ordering::Relaxed),
             D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32
         );
-=======
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_backs_tracks_spans_copies_mapped_rows_and_skips_unmapped_memory() {
+        use super::{read_back_ranges, read_back_span, read_backs};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        assert_eq!(read_back_span(0x1000, [16, 3, 64]), Some((0x1000, 0x1090)));
+        assert_eq!(read_back_span(0x1000, [0, 3, 64]), None);
+        assert_eq!(read_back_span(0x1000, [16, 0, 64]), None);
+        assert_eq!(read_back_span(usize::MAX - 8, [16, 1, 16]), None);
+
+        let Some(host) = super::host() else {
+            return;
+        };
         let list = host.new_list().unwrap();
         let rb_mapped = host.read_back_buffer(512).unwrap();
         let rb_unmapped = host.read_back_buffer(256).unwrap();
@@ -7041,6 +7042,5 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(&dst[16..32], &[0xCCu8; 16]);
         assert_eq!(&dst[32..48], &[0x5Au8; 16]);
         assert_eq!(&dst[48..64], &[0xCCu8; 16]);
->>>>>>> 43bc444 (GPU/host: track deferred read-backs in late line.written and copy via write_mapped)
     }
 }
