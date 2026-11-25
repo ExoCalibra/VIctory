@@ -1076,7 +1076,7 @@ fn pages_written(pages: &[usize], offset: usize, len: usize) {
     SHOWN[0].fetch_add(1, Ordering::Relaxed);
     for (at, bytes) in runs {
         SHOWN[1].fetch_add(bytes as u64, Ordering::Relaxed);
-        victory_gpu::kernel_will_write(at, bytes);
+        drop(victory_gpu::kernel_will_write(at, bytes));
     }
 }
 
