@@ -1621,6 +1621,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }
     }
+}
 
 /// EXP `exp target, v0, v1, v2, v3 [done] [vm]` (`en`: 4-bit channel mask).
 const fn exp_inst(target: u8, en: u8, v: [u8; 4], done: bool, vm: bool) -> [u32; 2] {
